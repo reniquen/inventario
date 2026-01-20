@@ -282,7 +282,7 @@ function lucideIcon($name, $class = "w-5 h-5") {
         document.getElementById('productModal').classList.add('hidden');
     }
     
-    // Cerrar modal al hacer clic fuera
+    // Cerrar modal al hacer clic fuera 1234
     document.getElementById('productModal').addEventListener('click', function(e) {
         if (e.target === this) {
             closeModal();
