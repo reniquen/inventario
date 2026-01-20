@@ -7,13 +7,12 @@ if (!isset($_SESSION['user_id'])) {
     exit;
 }
 
-// 2. Configuración basada en la SESIÓN
+// 2. Configuración y Roles
 $currentRole   = $_SESSION['user_rol']; 
 $activeTab     = $_GET['tab']    ?? 'inventory';
 $searchTerm    = $_GET['search'] ?? '';
-$assignedArea  = $_SESSION['user_area'] ?? ''; // Previene error si no está definido
+$assignedArea  = $_SESSION['user_area'] ?? '';
 
-// Definición de constantes de roles
 if (!defined('ROLES')) {
     define('ROLES', [
         'ADMIN' => 'admin',
@@ -26,7 +25,7 @@ if (!defined('ROLES')) {
 $host = 'localhost';
 $db   = 'stockmaster_db';
 $user = 'root'; 
-$pass = 'mysql'; // Ajusta esto si tu clave es vacía '' o 'root'
+$pass = 'mysql'; // Tu contraseña
 
 try {
     $pdo = new PDO("mysql:host=$host;dbname=$db;charset=utf8mb4", $user, $pass, [
@@ -39,59 +38,76 @@ try {
 
 // --- 4. PROCESAMIENTO DE ACCIONES (BACKEND) ---
 
-// A. Eliminar (Solo ADMIN)
+// A. Eliminar
 if (isset($_GET['delete_id']) && $currentRole === ROLES['ADMIN']) {
+    // Opcional: Borrar el archivo físico también si lo deseas
+    $stmt = $pdo->prepare("SELECT imagen_path FROM productos WHERE id = ?");
+    $stmt->execute([$_GET['delete_id']]);
+    $img = $stmt->fetchColumn();
+    if($img && file_exists($img)) { unlink($img); } // Borra la foto de la carpeta
+
     $stmt = $pdo->prepare("DELETE FROM productos WHERE id = ?");
     $stmt->execute([$_GET['delete_id']]);
     header("Location: index.php?tab=$activeTab");
     exit;
 }
 
-// B. Agregar o Editar (ADMIN y ENCARGADO)
+// B. Agregar o Editar
 if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['action']) && $currentRole !== ROLES['CONSULTOR']) {
-    $nombre = $_POST['nombre'];
-    $sku    = $_POST['sku'];
-    $stock  = $_POST['stock'];
+    $nombre  = $_POST['nombre'];
+    $sku     = $_POST['sku'];
+    $stock   = $_POST['stock'];
     $id_area = $_POST['id_area'];
-
-    // Acción: Agregar (Solo Admin)
-    if ($_POST['action'] === 'add' && $currentRole === ROLES['ADMIN']) {
-        $stmt = $pdo->prepare("INSERT INTO productos (nombre, sku, stock, id_area) VALUES (?, ?, ?, ?)");
-        $stmt->execute([$nombre, $sku, $stock, $id_area]);
     
-    // Acción: Editar (Admin y Encargado)
+    // --- LÓGICA DE SUBIDA DE IMAGEN ---
+    $imagenPath = $_POST['current_image_path'] ?? null; // Mantener imagen vieja si existe
+
+    if (isset($_FILES['imagen']) && $_FILES['imagen']['error'] === UPLOAD_ERR_OK) {
+        $uploadDir = 'uploads/';
+        // Crear nombre único: timestamp_nombredelarchivo.jpg
+        $fileName = time() . '_' . basename($_FILES['imagen']['name']); 
+        $targetFile = $uploadDir . $fileName;
+        
+        // Validar tipo de archivo (Básico)
+        $fileType = strtolower(pathinfo($targetFile, PATHINFO_EXTENSION));
+        if(in_array($fileType, ['jpg', 'jpeg', 'png', 'webp'])) {
+            if (move_uploaded_file($_FILES['imagen']['tmp_name'], $targetFile)) {
+                $imagenPath = $targetFile; // Guardamos la ruta relativa "uploads/foto.jpg"
+            }
+        }
+    }
+    // ----------------------------------
+
+    // Acción: Agregar
+    if ($_POST['action'] === 'add' && $currentRole === ROLES['ADMIN']) {
+        $stmt = $pdo->prepare("INSERT INTO productos (nombre, sku, stock, id_area, imagen_path) VALUES (?, ?, ?, ?, ?)");
+        $stmt->execute([$nombre, $sku, $stock, $id_area, $imagenPath]);
+    
+    // Acción: Editar
     } elseif ($_POST['action'] === 'edit') {
-        // Validar que el ID existe
         if(isset($_POST['id'])){
-            $stmt = $pdo->prepare("UPDATE productos SET nombre=?, sku=?, stock=?, id_area=? WHERE id=?");
-            $stmt->execute([$nombre, $sku, $stock, $id_area, $_POST['id']]);
+            $stmt = $pdo->prepare("UPDATE productos SET nombre=?, sku=?, stock=?, id_area=?, imagen_path=? WHERE id=?");
+            $stmt->execute([$nombre, $sku, $stock, $id_area, $imagenPath, $_POST['id']]);
         }
     }
     header("Location: index.php?tab=$activeTab");
     exit;
 }
 
-// 5. CONSULTA DE DATOS FILTRADA
+// 5. CONSULTA DE DATOS
 $query = "SELECT p.*, a.nombre AS area_nombre FROM productos p 
           LEFT JOIN areas a ON p.id_area = a.id 
           WHERE p.nombre LIKE :search";
 
-// Si es ENCARGADO, forzamos el filtro por su área
-if ($currentRole === ROLES['ENCARGADO']) { 
-    $query .= " AND a.nombre = :area"; 
-}
+if ($currentRole === ROLES['ENCARGADO']) { $query .= " AND a.nombre = :area"; }
 
 $stmt = $pdo->prepare($query);
 $params = [':search' => "%$searchTerm%"];
-
-if ($currentRole === ROLES['ENCARGADO']) { 
-    $params[':area'] = $assignedArea; 
-}
+if ($currentRole === ROLES['ENCARGADO']) { $params[':area'] = $assignedArea; }
 
 $stmt->execute($params);
 $inventory = $stmt->fetchAll();
 
-// Obtener lista de áreas para el formulario (Select)
 $areasList = $pdo->query("SELECT * FROM areas")->fetchAll();
 
 function lucideIcon($name, $class = "w-5 h-5") {
@@ -138,7 +154,6 @@ function lucideIcon($name, $class = "w-5 h-5") {
                     Área: <span class="text-indigo-400"><?= htmlspecialchars($assignedArea) ?></span>
                 <?php endif; ?>
             </div>
-            
             <form class="relative">
                 <input type="text" name="search" placeholder="Buscar..." value="<?= htmlspecialchars($searchTerm) ?>" class="bg-slate-800 border border-slate-700 rounded-xl pl-10 pr-4 py-2 text-sm focus:ring-2 focus:ring-indigo-500 outline-none">
                 <div class="absolute left-3 top-2.5 text-slate-500"><?= lucideIcon('search', 'w-4 h-4') ?></div>
@@ -152,7 +167,6 @@ function lucideIcon($name, $class = "w-5 h-5") {
                         <h1 class="text-2xl font-bold">Gestión de Inventario</h1>
                         <p class="text-slate-500 text-sm">Mostrando <?= count($inventory) ?> productos.</p>
                     </div>
-                    
                     <?php if ($currentRole === ROLES['ADMIN']): ?>
                         <button onclick="openModal('add')" class="bg-indigo-600 hover:bg-indigo-500 px-4 py-2 rounded-xl font-bold flex items-center gap-2 transition-all">
                             <?= lucideIcon('plus') ?> Nuevo Producto
@@ -164,7 +178,7 @@ function lucideIcon($name, $class = "w-5 h-5") {
                     <table class="w-full text-left">
                         <thead class="bg-slate-800/50 text-slate-500 text-[10px] uppercase tracking-widest">
                             <tr>
-                                <th class="px-6 py-4">Producto / SKU</th>
+                                <th class="px-6 py-4">Imagen</th> <th class="px-6 py-4">Producto / SKU</th>
                                 <th class="px-6 py-4 text-center">Área</th>
                                 <th class="px-6 py-4 text-center">Stock</th>
                                 <th class="px-6 py-4 text-center">Acciones</th>
@@ -173,6 +187,21 @@ function lucideIcon($name, $class = "w-5 h-5") {
                         <tbody class="divide-y divide-slate-800">
                             <?php foreach ($inventory as $item): ?>
                             <tr class="hover:bg-slate-800/30 transition-colors">
+                                <td class="px-6 py-4">
+                                    <?php if(!empty($item['imagen_path'])): ?>
+                                        <div class="group relative w-12 h-12">
+                                            <img src="<?= htmlspecialchars($item['imagen_path']) ?>" class="w-full h-full object-cover rounded-lg border border-slate-700">
+                                            <button onclick="copyToClipboard('<?= htmlspecialchars($item['imagen_path']) ?>')" title="Copiar ruta" class="absolute -right-2 -bottom-2 bg-slate-700 hover:bg-indigo-500 text-white p-1 rounded-full shadow-lg opacity-0 group-hover:opacity-100 transition-all">
+                                                <?= lucideIcon('copy', 'w-3 h-3') ?>
+                                            </button>
+                                        </div>
+                                    <?php else: ?>
+                                        <div class="w-12 h-12 bg-slate-800 rounded-lg flex items-center justify-center text-slate-600">
+                                            <?= lucideIcon('image-off', 'w-4 h-4') ?>
+                                        </div>
+                                    <?php endif; ?>
+                                </td>
+                                
                                 <td class="px-6 py-4">
                                     <div class="font-bold"><?= htmlspecialchars($item['nombre']) ?></div>
                                     <div class="text-[10px] text-slate-500 font-mono"><?= $item['sku'] ?></div>
@@ -212,13 +241,20 @@ function lucideIcon($name, $class = "w-5 h-5") {
     <div class="bg-slate-900 border border-slate-800 p-8 rounded-3xl w-full max-w-md">
         <h2 id="modalTitle" class="text-2xl font-bold mb-6">Producto</h2>
         
-        <form method="POST" id="productForm" class="space-y-4">
+        <form method="POST" id="productForm" class="space-y-4" enctype="multipart/form-data">
             <input type="hidden" name="action" id="formAction" value="add">
             <input type="hidden" name="id" id="productId">
-            
-            <div>
+            <input type="hidden" name="current_image_path" id="currentImagePath"> <div>
                 <label class="text-xs font-bold text-slate-500 uppercase">Nombre</label>
                 <input type="text" name="nombre" id="p_nombre" required class="w-full bg-slate-800 border border-slate-700 rounded-xl px-4 py-3 mt-1 outline-none focus:ring-2 focus:ring-indigo-500">
+            </div>
+
+            <div>
+                <label class="text-xs font-bold text-slate-500 uppercase">Imagen del Producto</label>
+                <div class="mt-1 flex items-center gap-4">
+                    <input type="file" name="imagen" accept="image/*" class="w-full text-sm text-slate-500 file:mr-4 file:py-2 file:px-4 file:rounded-full file:border-0 file:text-xs file:font-semibold file:bg-indigo-600 file:text-white hover:file:bg-indigo-500 cursor-pointer bg-slate-800 rounded-xl border border-slate-700">
+                </div>
+                <p id="imageStatus" class="text-[10px] text-indigo-400 mt-1 hidden">Imagen actual guardada.</p>
             </div>
             
             <div class="grid grid-cols-2 gap-4">
@@ -250,30 +286,46 @@ function lucideIcon($name, $class = "w-5 h-5") {
 </div>
 
 <script>
-    // Inicializar iconos
     lucide.createIcons();
+
+    // Función para copiar Path
+    function copyToClipboard(text) {
+        navigator.clipboard.writeText(text).then(() => {
+            alert("Ruta copiada: " + text); // Feedback simple
+        }).catch(err => {
+            console.error('Error al copiar: ', err);
+        });
+    }
 
     function openModal(mode, data = null) {
         const modal = document.getElementById('productModal');
         const form = document.getElementById('productForm');
-        
-        // Mostrar modal
         modal.classList.remove('hidden');
         
         if (mode === 'edit' && data) {
-            // Modo Edición: Rellenar datos
             document.getElementById('modalTitle').innerText = 'Editar Producto';
             document.getElementById('formAction').value = 'edit';
             document.getElementById('productId').value = data.id;
+            document.getElementById('currentImagePath').value = data.imagen_path || ''; // Guardar ruta vieja
             
             document.getElementById('p_nombre').value = data.nombre;
             document.getElementById('p_sku').value = data.sku;
             document.getElementById('p_stock').value = data.stock;
             document.getElementById('p_area').value = data.id_area;
+
+            // Mostrar aviso si ya hay imagen
+            if(data.imagen_path) {
+                document.getElementById('imageStatus').classList.remove('hidden');
+                document.getElementById('imageStatus').innerText = 'Tiene imagen: ' + data.imagen_path;
+            } else {
+                document.getElementById('imageStatus').classList.add('hidden');
+            }
+
         } else {
-            // Modo Agregar: Limpiar formulario
             document.getElementById('modalTitle').innerText = 'Nuevo Producto';
             document.getElementById('formAction').value = 'add';
+            document.getElementById('currentImagePath').value = ''; 
+            document.getElementById('imageStatus').classList.add('hidden');
             form.reset();
         }
     }
@@ -282,11 +334,8 @@ function lucideIcon($name, $class = "w-5 h-5") {
         document.getElementById('productModal').classList.add('hidden');
     }
     
-    // Cerrar modal al hacer clic fuera 1234
     document.getElementById('productModal').addEventListener('click', function(e) {
-        if (e.target === this) {
-            closeModal();
-        }
+        if (e.target === this) closeModal();
     });
 </script>
 </body>
