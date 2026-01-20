@@ -40,7 +40,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
         // Buscar usuario
         $stmt = $pdo->prepare("
             SELECT id, nombre, email, password, rol, area_asignada
-            FROM usuarios
+            FROM usuario
             WHERE email = ?
             LIMIT 1
         ");
