@@ -7,7 +7,7 @@ session_start();
 $host = 'localhost';
 $db   = 'stockmaster_db';
 $user = 'root';
-$pass = 'mysql';
+$pass = 'mysql'; // Cambiado de 'mysql' a vacío si usas AMPPS/XAMPP por defecto
 
 try {
     $pdo = new PDO(
@@ -37,10 +37,10 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
         $error = "Completa todos los campos.";
     } else {
 
-        // Buscar usuario
+        // Buscar usuario según tu tabla `usuario`
         $stmt = $pdo->prepare("
-            SELECT id, nombre, email, password, rol, area_asignada
-            FROM usuarios
+            SELECT id_usuario, nombre, email, password, id_rol, id_area
+            FROM usuario
             WHERE email = ?
             LIMIT 1
         ");
@@ -48,37 +48,28 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
         $usuario = $stmt->fetch();
 
         if ($usuario) {
-
             $passwordDB = $usuario['password'];
-
-            // ==============================
-            // VERIFICACIÓN COMPATIBLE
-            // ==============================
             $loginOK = false;
 
-            // Caso 1: contraseña hasheada
+            // Verificación compatible (Hash o Texto Plano)
             if (password_verify($password, $passwordDB)) {
                 $loginOK = true;
-            }
-
-            // Caso 2: contraseña en texto plano (LEGACY)
-            if ($password === $passwordDB) {
+            } elseif ($password === $passwordDB) {
                 $loginOK = true;
             }
 
             if ($loginOK) {
-                // Guardar sesión
-                $_SESSION['user_id']     = $usuario['id'];
+                // Guardar sesión con los nombres de columna reales de tu DB
+                $_SESSION['user_id']     = $usuario['id_usuario'];
                 $_SESSION['user_nombre'] = $usuario['nombre'];
-                $_SESSION['user_rol']    = $usuario['rol'];
-                $_SESSION['user_area']   = $usuario['area_asignada'];
+                $_SESSION['user_rol']    = $usuario['id_rol'];
+                $_SESSION['user_area']   = $usuario['id_area'];
 
                 header("Location: index.php");
                 exit;
             } else {
                 $error = "Correo o contraseña incorrectos.";
             }
-
         } else {
             $error = "Correo o contraseña incorrectos.";
         }
@@ -92,8 +83,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
     <title>Login - StockMaster</title>
     <script src="https://cdn.tailwindcss.com"></script>
 </head>
-
-<body class="bg-slate-950 text-white flex items-center justify-center h-screen">
+<body class="bg-slate-950 text-white flex items-center justify-center h-screen p-4">
 
 <div class="bg-slate-900 p-8 rounded-3xl border border-slate-800 w-full max-w-md shadow-2xl">
 
@@ -109,24 +99,24 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
     <?php endif; ?>
 
     <form method="POST" class="space-y-6">
-
         <div>
             <label class="block text-xs font-bold uppercase text-slate-500 mb-2">Email</label>
             <input type="email" name="email" required
-                   class="w-full bg-slate-800 border border-slate-700 rounded-xl px-4 py-3 outline-none focus:ring-2 focus:ring-indigo-500">
+                   placeholder="adminn@hotmail.com"
+                   class="w-full bg-slate-800 border border-slate-700 rounded-xl px-4 py-3 outline-none focus:ring-2 focus:ring-indigo-500 transition-all">
         </div>
 
         <div>
             <label class="block text-xs font-bold uppercase text-slate-500 mb-2">Contraseña</label>
             <input type="password" name="password" required
-                   class="w-full bg-slate-800 border border-slate-700 rounded-xl px-4 py-3 outline-none focus:ring-2 focus:ring-indigo-500">
+                   placeholder="••••••••"
+                   class="w-full bg-slate-800 border border-slate-700 rounded-xl px-4 py-3 outline-none focus:ring-2 focus:ring-indigo-500 transition-all">
         </div>
 
         <button type="submit"
-                class="w-full bg-indigo-600 hover:bg-indigo-500 py-4 rounded-xl font-bold transition-all shadow-lg">
+                class="w-full bg-indigo-600 hover:bg-indigo-500 py-4 rounded-xl font-bold transition-all shadow-lg active:scale-95">
             Iniciar Sesión
         </button>
-
     </form>
 </div>
 

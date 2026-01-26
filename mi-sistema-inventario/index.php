@@ -35,8 +35,8 @@ $allowedTabsByRole = [
     ROLES['ADMIN']     => ['inventory', 'statistics', 'roles', 'movements', 'purchases']
 ];
 
-if (!in_array($activeTab, $allowedTabsByRole[$currentRole])) {
-    $activeTab = 'inventory';
+if (isset($_GET['error']) && $_GET['error'] === 'timeout') {
+    $error = "Tu sesión ha expirado por inactividad. Por favor, ingresa nuevamente.";
 }
 
 
@@ -207,7 +207,7 @@ function lucideIcon($name, $class = "w-5 h-5") {
         <div class="p-6 border-t border-slate-800 text-xs text-slate-500">
             <p>Usuario: <span class="text-white font-medium"><?= htmlspecialchars($_SESSION['user_nombre']) ?></span></p>
             <p>Rol: <span class="text-indigo-400 font-bold uppercase"><?= $currentRole ?></span></p>
-            <a href="logout.php" class="mt-4 flex items-center gap-2 text-red-400 hover:text-red-300 transition-colors">
+            <a href="login.php" class="mt-4 flex items-center gap-2 text-red-400 hover:text-red-300 transition-colors">
                 <?= lucideIcon('log-out', 'w-4 h-4') ?> Cerrar Sesión
             </a>
         </div>
