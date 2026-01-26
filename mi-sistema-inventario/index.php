@@ -31,8 +31,8 @@ if (!defined('ROLES')) {
 
 $allowedTabsByRole = [
     ROLES['CONSULTOR'] => ['inventory', 'statistics'],
-    ROLES['ENCARGADO'] => ['inventory', 'statistics'],
-    ROLES['ADMIN']     => ['inventory', 'statistics', 'roles']
+    ROLES['ENCARGADO'] => ['inventory', 'statistics', 'movements'],
+    ROLES['ADMIN']     => ['inventory', 'statistics', 'roles', 'movements']
 ];
 
 if (!in_array($activeTab, $allowedTabsByRole[$currentRole])) {
@@ -112,6 +112,7 @@ if (
 }
 
 
+
 // 5. CONSULTA DE DATOS
 $query = "SELECT p.*, a.nombre_area FROM PRODUCTO p 
           LEFT JOIN AREA a ON p.id_area = a.id_area 
@@ -120,6 +121,7 @@ $query = "SELECT p.*, a.nombre_area FROM PRODUCTO p
 if ($currentRole === ROLES['ENCARGADO']) { 
     $query .= " AND a.nombre_area = :area"; 
 }
+
 
 $stmt = $pdo->prepare($query);
 $params = [':search' => "%$searchTerm%"];
@@ -134,6 +136,27 @@ $users = $pdo->query("
     FROM USUARIO u
     JOIN ROL r ON u.id_rol = r.id_rol
 ")->fetchAll();
+
+
+
+
+
+$movimientos = $pdo->query("
+    SELECT 
+        m.id_movimiento,
+        m.tipo,
+        m.fecha,
+        m.motivo,
+        u.nombre AS usuario,
+        p.nombre AS producto,
+        d.cantidad
+    FROM movimiento m
+    JOIN detalle_movimiento d ON m.id_movimiento = d.id_movimiento
+    JOIN producto p ON d.id_producto = p.id_producto
+    JOIN usuario u ON m.id_usuario = u.id_usuario
+    ORDER BY m.fecha DESC
+")->fetchAll();
+
 
 function lucideIcon($name, $class = "w-5 h-5") {
     return "<i data-lucide='{$name}' class='{$class}'></i>";
@@ -170,6 +193,9 @@ function lucideIcon($name, $class = "w-5 h-5") {
                     <?= lucideIcon('shield') ?> Gestión de Roles
                 </a>
             <?php endif; ?>
+            <a href="?tab=movements" class="flex items-center gap-3 p-3 rounded-xl <?= $activeTab === 'movements' ? 'bg-indigo-600/20 text-indigo-400 border border-indigo-500/20' : 'hover:bg-slate-800 text-slate-400' ?>">
+                <?= lucideIcon('history') ?> Movimientos
+            </a>
         </nav>
 
         <div class="p-6 border-t border-slate-800 text-xs text-slate-500">
@@ -219,6 +245,9 @@ function lucideIcon($name, $class = "w-5 h-5") {
                             <th class="px-6 py-5 text-center">Área</th>
                             <th class="px-6 py-5 text-center">Precio</th>
                             <th class="px-6 py-5 text-center">Stock</th>
+                            <?php if (in_array($currentRole, [ROLES['ADMIN'], ROLES['ENCARGADO']])): ?>
+                                <th class="px-6 py-5 text-center">Proveedor</th>
+                            <?php endif; ?>
                             <th class="px-8 py-5 text-right">Acciones</th>
                         </tr>
                     </thead>
@@ -243,6 +272,12 @@ function lucideIcon($name, $class = "w-5 h-5") {
                             <td class="px-6 py-5 text-center font-bold <?= $item['stock'] < 10 ? 'text-red-500' : 'text-emerald-400' ?>">
                                 <?= $item['stock'] ?>
                             </td>
+                            <?php if (in_array($currentRole, [ROLES['ADMIN'], ROLES['ENCARGADO']])): ?>
+                                <td class="px-6 py-5 text-center text-slate-400 text-sm">
+                                    <?= htmlspecialchars($item['proveedor'] ?? '—') ?>
+                                </td>
+                            <?php endif; ?>
+
                             <td class="px-8 py-5 text-right">
                                 <div class="flex justify-end gap-2">
                                     <?php if ($currentRole !== ROLES['CONSULTOR']): ?>
@@ -254,6 +289,8 @@ function lucideIcon($name, $class = "w-5 h-5") {
                                         <a href="?delete_id=<?= $item['id_producto'] ?>" onclick="return confirm('¿Eliminar?')" class="p-2 hover:bg-red-500/20 text-slate-400 hover:text-red-400 rounded-xl">
                                             <?= lucideIcon('trash-2', 'w-4 h-4') ?>
                                         </a>
+
+
                                     <?php endif; ?>
                                 </div>
                             </td>
@@ -271,7 +308,7 @@ function lucideIcon($name, $class = "w-5 h-5") {
 
             <div class="grid grid-cols-1 md:grid-cols-3 gap-6">
                 <div class="bg-slate-900 border border-slate-800 rounded-2xl p-6">
-                    <p class="text-slate-400 text-sm">Total de Productos</p>
+                    <p class="text-slate-400 text-sm">vaiedad de Productos</p>
                     <p class="text-3xl font-bold text-indigo-400"><?= count($inventory) ?></p>
                 </div>
 
@@ -345,7 +382,42 @@ function lucideIcon($name, $class = "w-5 h-5") {
                     </tbody>
                 </table>
             </div>
+        <?php elseif ($activeTab === 'movements'): ?>
+              <!-- ================= MOVIMIENTO-HISTORIAL ================= -->
+            <h1 class="text-3xl font-bold text-white mb-2">Historial de Movimientos</h1>
+            <p class="text-slate-500 mb-8">Registro de entradas y salidas</p>
+
+            <div class="bg-slate-900 border border-slate-800 rounded-[2rem] overflow-hidden">
+                <table class="w-full text-left border-collapse">
+                    <thead class="bg-slate-800/50 text-slate-500 text-[10px] uppercase tracking-widest">
+                        <tr>
+                            <th class="px-6 py-4">Fecha</th>
+                            <th class="px-6 py-4">Tipo</th>
+                            <th class="px-6 py-4">Producto</th>
+                            <th class="px-6 py-4 text-center">Cantidad</th>
+                            <th class="px-6 py-4">Motivo</th>
+                            <th class="px-6 py-4">Usuario</th>
+                        </tr>
+                    </thead>
+                    <tbody class="divide-y divide-slate-800">
+                        <?php foreach ($movimientos as $m): ?>
+                        <tr class="hover:bg-slate-800/30">
+                            <td class="px-6 py-4 text-slate-400"><?= $m['fecha'] ?></td>
+                            <td class="px-6 py-4 font-bold <?= $m['tipo'] === 'ENTRADA' ? 'text-emerald-400' : 'text-red-400' ?>">
+                                <?= $m['tipo'] ?>
+                            </td>
+                            <td class="px-6 py-4"><?= htmlspecialchars($m['producto']) ?></td>
+                            <td class="px-6 py-4 text-center"><?= $m['cantidad'] ?></td>
+                            <td class="px-6 py-4 text-slate-400"><?= htmlspecialchars($m['motivo']) ?></td>
+                            <td class="px-6 py-4"><?= htmlspecialchars($m['usuario']) ?></td>
+                        </tr>
+                        <?php endforeach; ?>
+                    </tbody>
+                </table>
+            </div>
+
         <?php endif; ?>
+        
 
     </div>
 </section>
