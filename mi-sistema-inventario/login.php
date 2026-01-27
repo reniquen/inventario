@@ -102,7 +102,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
         <div>
             <label class="block text-xs font-bold uppercase text-slate-500 mb-2">Email</label>
             <input type="email" name="email" required
-                   placeholder="adminn@hotmail.com"
+                   placeholder="admin@example.com"
                    class="w-full bg-slate-800 border border-slate-700 rounded-xl px-4 py-3 outline-none focus:ring-2 focus:ring-indigo-500 transition-all">
         </div>
 
