@@ -13,7 +13,13 @@ header("Cache-Control: no-cache, no-store, must-revalidate"); // HTTP 1.1.
 header("Pragma: no-cache"); // HTTP 1.0.
 header("Expires: 0"); // Proxies.
 
-
+/*                               <?php if ($c['estado_oc'] !== 'Completada'): ?>
+                                    <a href="complete_oc.php?id=<?= $c['id_orden_compra'] ?>" 
+                                    onclick="return confirm('¿Confirmar recepción de suministros? Esto subirá el stock.')"
+                                    class="bg-indigo-600 p-2 rounded-lg text-white hover:bg-indigo-500">
+                                    <?= lucideIcon('check-circle') ?> Recepcionar
+                                    </a>
+                                <?php endif; ?> */
 
 // 2. Configuración de Roles y Sesión
 $currentRole   = $_SESSION['user_rol']; 
@@ -86,14 +92,29 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['action']) && $current
     }
 
     if ($_POST['action'] === 'add' && $currentRole === ROLES['ADMIN']) {
-        $stmt = $pdo->prepare("INSERT INTO PRODUCTO (nombre, sku, stock, precio, id_area, imagen_path, estado) VALUES (?, ?, ?, ?, ?, ?, 'Activo')");
-        $stmt->execute([$nombre, $sku, $stock, $precio, $id_area, $imagenPath]);
-    } elseif ($_POST['action'] === 'edit' && isset($_POST['id_producto'])) {
-        $stmt = $pdo->prepare("UPDATE PRODUCTO SET nombre=?, sku=?, stock=?, precio=?, id_area=?, imagen_path=? WHERE id_producto=?");
-        $stmt->execute([$nombre, $sku, $stock, $precio, $id_area, $imagenPath, $_POST['id_producto']]);
+    try {
+        $pdo->beginTransaction();
+
+        // 1. Insertamos el producto con STOCK 0 (El trigger se encargará de subirlo)
+        $stmt = $pdo->prepare("INSERT INTO producto (nombre, sku, stock, precio_referencial, imagen_path, estado) VALUES (?, ?, 0, ?, ?, 'activo')");
+        $stmt->execute([$nombre, $sku, $precio, $imagenPath]);
+        $idNuevoProducto = $pdo->lastInsertId();
+
+        // 2. Insertamos el movimiento (Esto activa el Trigger)
+        $stmtMov = $pdo->prepare("INSERT INTO movimiento (id_usuario, tipo, motivo, id_area) VALUES (?, 'ENTRADA', 'Carga inicial de producto', NULL)");
+        $stmtMov->execute([$_SESSION['user_id']]);
+        $idMovimiento = $pdo->lastInsertId();
+
+        // 3. Insertamos el detalle (Aquí es donde el Trigger de la DB suma el stock real)
+        $stmtDet = $pdo->prepare("INSERT INTO detalle_movimiento (id_movimiento, id_producto, cantidad) VALUES (?, ?, ?)");
+        $stmtDet->execute([$idMovimiento, $idNuevoProducto, $stock]);
+
+        $pdo->commit();
+    } catch (Exception $e) {
+        $pdo->rollBack();
+        die("Error: " . $e->getMessage());
     }
-    header("Location: index.php?tab=$activeTab");
-    exit;
+}
 }
 if (
     $_SERVER['REQUEST_METHOD'] === 'POST' &&
@@ -143,21 +164,23 @@ $users = $pdo->query("
 ")->fetchAll();
 
 // En la sección de consultas de tu PHP, reemplaza la consulta de movimientos:
+// Consulta mejorada para trazabilidad Origen -> Destino
 $movimientos = $pdo->query("
     SELECT 
-        m.id_movimiento,
-        m.tipo,
         m.fecha,
-        m.motivo,
-        u.nombre AS usuario,
-        a.nombre_area AS area_destino, -- Agregamos el área
+        m.tipo,
         p.nombre AS producto,
-        d.cantidad
+        d.cantidad,
+        u.nombre AS usuario,
+        a_orig.nombre_area AS origen,   -- Área que entrega
+        a_dest.nombre_area AS destino,  -- Área que recibe
+        IFNULL(m.motivo, 'S/M') AS motivo -- Evita el error de 'Undefined key'
     FROM movimiento m
     JOIN detalle_movimiento d ON m.id_movimiento = d.id_movimiento
     JOIN producto p ON d.id_producto = p.id_producto
     JOIN usuario u ON m.id_usuario = u.id_usuario
-    LEFT JOIN area a ON m.id_area = a.id_area -- Relacionamos con el área
+    LEFT JOIN area a_orig ON m.id_area_origen = a_orig.id_area
+    LEFT JOIN area a_dest ON m.id_area = a_dest.id_area
     ORDER BY m.fecha DESC
 ")->fetchAll();
 
@@ -395,8 +418,15 @@ function lucideIcon($name, $class = "w-5 h-5") {
                 </table>
             </div>
         <?php elseif ($activeTab === 'movements'): ?>
-            <h1 class="text-3xl font-bold text-white mb-2">Historial de Movimientos</h1>
-            <p class="text-slate-500 mb-8">Registro de entradas y transferencias entre áreas</p>
+            <div class="flex justify-between items-end mb-8">
+                <div>
+                    <h1 class="text-3xl font-bold text-white">Historial de Movimientos</h1>
+                    <p class="text-slate-500">Registro de entradas y transferencias entre áreas</p>
+                </div>
+                <button onclick="openMovementModal()" class="bg-emerald-600 hover:bg-emerald-500 px-6 py-3 rounded-2xl font-bold flex items-center gap-2 shadow-lg shadow-emerald-600/20">
+                    <?= lucideIcon('arrow-right-left') ?> Registrar Salida / Traspaso
+                </button>
+            </div>
 
             <div class="bg-slate-900 border border-slate-800 rounded-[2rem] overflow-hidden">
                 <table class="w-full text-left border-collapse">
@@ -406,8 +436,7 @@ function lucideIcon($name, $class = "w-5 h-5") {
                             <th class="px-6 py-4">Tipo</th>
                             <th class="px-6 py-4">Producto</th>
                             <th class="px-6 py-4 text-center">Cant.</th>
-                            <th class="px-6 py-4">Área Relacionada</th>
-                            <th class="px-6 py-4">Motivo</th>
+                            <th class="px-6 py-4">Ruta del Movimiento</th> <th class="px-6 py-4">Motivo</th>
                             <th class="px-6 py-4">Responsable</th>
                         </tr>
                     </thead>
@@ -425,14 +454,95 @@ function lucideIcon($name, $class = "w-5 h-5") {
                             <td class="px-6 py-4 font-medium"><?= htmlspecialchars($m['producto']) ?></td>
                             <td class="px-6 py-4 text-center font-mono"><?= $m['cantidad'] ?></td>
                             <td class="px-6 py-4">
-                                <span class="text-slate-300 text-sm italic">
-                                    <?= htmlspecialchars($m['area_destino'] ?? 'Bodega Central') ?>
-                                </span>
+                                <div class="flex flex-col gap-1">
+                                    <div class="flex items-center gap-2">
+                                        <span class="text-slate-500 text-[10px] font-bold uppercase tracking-wider">
+                                            <?= htmlspecialchars($m['origen']) ?>
+                                        </span>
+                                        
+                                        <span class="text-indigo-500 flex items-center">
+                                            <?= lucideIcon('move-right', 'w-4 h-4') ?>
+                                        </span>
+                                        
+                                        <span class="text-slate-200 font-bold text-sm">
+                                            <?= htmlspecialchars($m['destino']) ?>
+                                        </span>
+                                    </div>
+                                    
+                                    <div class="flex items-center gap-1">
+                                        <span class="w-1.5 h-1.5 rounded-full bg-indigo-500 animate-pulse"></span>
+                                        <span class="text-[9px] text-slate-500 uppercase font-medium">Trazabilidad Activa</span>
+                                    </div>
+                                </div>
                             </td>
                             <td class="px-6 py-4 text-slate-400 text-sm"><?= htmlspecialchars($m['motivo']) ?></td>
                             <td class="px-6 py-4 text-xs"><?= htmlspecialchars($m['usuario']) ?></td>
                         </tr>
                         <?php endforeach; ?>
+                        <div id="movementModal" class="hidden fixed inset-0 bg-black/80 backdrop-blur-md z-[60] flex items-center justify-center p-4">
+                            <div class="bg-slate-900 border border-slate-800 p-8 rounded-[2.5rem] w-full max-w-md shadow-2xl">
+                                <h2 class="text-2xl font-bold mb-6 text-white text-center">Registrar Entrega</h2>
+                                
+                                <form method="POST" action="process_movement.php" class="space-y-4">
+                                    <div>
+                                        <label class="text-[10px] font-bold text-slate-500 uppercase ml-1">Producto a Entregar</label>
+                                        <select name="id_producto" required class="w-full bg-slate-800 border border-slate-700 rounded-2xl px-5 py-3 outline-none focus:ring-2 focus:ring-emerald-500">
+                                            <option value="" disabled selected>Seleccione un producto</option>
+                                            <?php foreach ($inventory as $prod): ?>
+                                                <option value="<?= $prod['id_producto'] ?>"><?= htmlspecialchars($prod['nombre']) ?> (Stock: <?= $prod['stock'] ?>)</option>
+                                            <?php endforeach; ?>
+                                        </select>
+                                    </div>
+
+                                    <div>
+                                        <label class="text-[10px] font-bold text-slate-500 uppercase ml-1">¿De qué área sale?</label>
+                                        <select name="id_area_origen" required class="w-full bg-slate-800 border border-slate-700 rounded-2xl px-5 py-3 outline-none focus:ring-2 focus:ring-amber-500">
+                                            <option value="NULL">Bodega Central (General)</option>
+                                            <?php foreach ($areasList as $area): ?>
+                                                <option value="<?= $area['id_area'] ?>"><?= htmlspecialchars($area['nombre_area']) ?></option>
+                                            <?php endforeach; ?>
+                                        </select>
+                                    </div>
+
+                                    <div>
+                                        <label class="text-[10px] font-bold text-slate-500 uppercase ml-1">¿A qué área va?</label>
+                                        <select name="id_area_destino" required class="w-full bg-slate-800 border border-slate-700 rounded-2xl px-5 py-3 outline-none focus:ring-2 focus:ring-emerald-500">
+                                            <?php foreach ($areasList as $area): ?>
+                                                <option value="<?= $area['id_area'] ?>"><?= htmlspecialchars($area['nombre_area']) ?></option>
+                                            <?php endforeach; ?>
+                                        </select>
+                                    </div>
+
+                                    <div class="space-y-4"> 
+                                        <div>
+                                            <label class="text-[10px] font-bold text-slate-500 uppercase ml-1">Cantidad</label>
+                                            <input type="number" name="cantidad" min="1" required 
+                                                class="w-full bg-slate-800 border border-slate-700 rounded-2xl px-5 py-3 outline-none focus:ring-2 focus:ring-emerald-500" 
+                                                placeholder="0">
+                                        </div>
+
+                                        <div>
+                                            <label class="text-[10px] font-bold text-slate-500 uppercase ml-1">Motivo / Glosa de Entrega</label>
+                                            <textarea name="motivo" rows="2" 
+                                                    class="w-full bg-slate-800 border border-slate-700 rounded-2xl px-5 py-3 outline-none focus:ring-2 focus:ring-emerald-500 resize-none" 
+                                                    placeholder="Ej: Suministros solicitados por dirección de salud para operativo médico..."></textarea>
+                                        </div>
+                                    </div>
+                                    <div class="flex gap-4 pt-6">
+                                        <button type="button" 
+                                                onclick="closeMovementModal()" 
+                                                class="flex-1 text-slate-500 font-bold hover:text-white transition-colors">
+                                            Cancelar
+                                        </button>
+                                        
+                                        <button type="submit" 
+                                                class="flex-1 bg-emerald-600 py-3 rounded-2xl font-bold text-white hover:bg-emerald-500 shadow-lg shadow-emerald-600/20 transition-all active:scale-95">
+                                            Confirmar Entrega
+                                        </button>
+                                    </div>
+                                </form>
+                            </div>
+                        </div>
                     </tbody>
                 </table>
             </div>
@@ -554,6 +664,19 @@ function lucideIcon($name, $class = "w-5 h-5") {
     document.getElementById('productModal').addEventListener('click', (e) => {
         if (e.target.id === 'productModal') closeModal();
     });
+    function openMovementModal() {
+    document.getElementById('movementModal').classList.remove('hidden');
+    }
+
+    function closeMovementModal() {
+        document.getElementById('movementModal').classList.add('hidden');
+    }
+
+    // Cerrar al hacer clic fuera
+    document.getElementById('movementModal').addEventListener('click', (e) => {
+        if (e.target.id === 'movementModal') closeMovementModal();
+    });
 </script>
 </body>
 </html>
+ 
