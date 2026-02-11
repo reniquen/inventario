@@ -13,19 +13,13 @@ header("Cache-Control: no-cache, no-store, must-revalidate"); // HTTP 1.1.
 header("Pragma: no-cache"); // HTTP 1.0.
 header("Expires: 0"); // Proxies.
 
-/*                               <?php if ($c['estado_oc'] !== 'Completada'): ?>
-                                    <a href="complete_oc.php?id=<?= $c['id_orden_compra'] ?>" 
-                                    onclick="return confirm('¿Confirmar recepción de suministros? Esto subirá el stock.')"
-                                    class="bg-indigo-600 p-2 rounded-lg text-white hover:bg-indigo-500">
-                                    <?= lucideIcon('check-circle') ?> Recepcionar
-                                    </a>
-                                <?php endif; ?> */
 
 // 2. Configuración de Roles y Sesión
 $currentRole   = $_SESSION['user_rol']; 
 $activeTab     = $_GET['tab']    ?? 'inventory';
 $searchTerm    = $_GET['search'] ?? '';
 $assignedArea  = $_SESSION['user_area'] ?? '';
+
 
 if (!defined('ROLES')) {
     define('ROLES', [
@@ -77,7 +71,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['action']) && $current
     $sku     = $_POST['sku'];
     $stock   = $_POST['stock'];
     $precio  = $_POST['precio'];
-    $id_area = $_POST['id_area'];
+    $id_area = $_POST['id_area'] ?? $_SESSION['user_area_id'];
     
     // Lógica de imagen
     $imagenPath = $_POST['current_image_path'] ?? null;
@@ -91,25 +85,33 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['action']) && $current
         }
     }
 
-    if ($_POST['action'] === 'add' && $currentRole === ROLES['ADMIN']) {
+if ($_POST['action'] === 'add' && $currentRole === ROLES['ADMIN']) {
     try {
         $pdo->beginTransaction();
 
-        // 1. Insertamos el producto con STOCK 0 (El trigger se encargará de subirlo)
-        $stmt = $pdo->prepare("INSERT INTO producto (nombre, sku, stock, precio_referencial, imagen_path, estado) VALUES (?, ?, 0, ?, ?, 'activo')");
-        $stmt->execute([$nombre, $sku, $precio, $imagenPath]);
-        $idNuevoProducto = $pdo->lastInsertId();
+        // 1. Insertamos el producto sin SKU todavía
+        $stmt = $pdo->prepare("INSERT INTO producto (nombre, stock, precio_referencial, imagen_path, estado, id_area) VALUES (?, 0, ?, ?, 'activo', ?)");
+        $stmt->execute([$nombre, $precio, $imagenPath, $id_area]);
+        
+        $idNuevo = $pdo->lastInsertId();
 
-        // 2. Insertamos el movimiento (Esto activa el Trigger)
-        $stmtMov = $pdo->prepare("INSERT INTO movimiento (id_usuario, tipo, motivo, id_area) VALUES (?, 'ENTRADA', 'Carga inicial de producto', NULL)");
-        $stmtMov->execute([$_SESSION['user_id']]);
-        $idMovimiento = $pdo->lastInsertId();
+        // 2. Generamos el Código Automático (SKU) basado en el ID
+        $nuevoCodigo = "SKU-" . str_pad($idNuevo, 4, "0", STR_PAD_LEFT);
+        
+        $stmtUpdate = $pdo->prepare("UPDATE producto SET sku = ? WHERE id_producto = ?");
+        $stmtUpdate->execute([$nuevoCodigo, $idNuevo]);
 
-        // 3. Insertamos el detalle (Aquí es donde el Trigger de la DB suma el stock real)
+        // 3. Registrar el movimiento inicial de stock (Carga de inventario)
+        $stmtMov = $pdo->prepare("INSERT INTO movimiento (id_usuario, tipo, motivo, id_area) VALUES (?, 'ENTRADA', 'Carga inicial automatizada', ?)");
+        $stmtMov->execute([$_SESSION['user_id'], $id_area]);
+        $idMov = $pdo->lastInsertId();
+
         $stmtDet = $pdo->prepare("INSERT INTO detalle_movimiento (id_movimiento, id_producto, cantidad) VALUES (?, ?, ?)");
-        $stmtDet->execute([$idMovimiento, $idNuevoProducto, $stock]);
+        $stmtDet->execute([$idMov, $idNuevo, $stock]);
 
         $pdo->commit();
+        header("Location: index.php?tab=inventory&msg=success");
+        exit;
     } catch (Exception $e) {
         $pdo->rollBack();
         die("Error: " . $e->getMessage());
@@ -134,24 +136,34 @@ if (
 
 
 
-// 5. CONSULTA DE DATOS ACTUALIZADA
+// --- 5. CONSULTA DE DATOS CON FILTRO DE ÁREA ---
 
+$areaFilter = "";
+$params = [':search' => "%$searchTerm%"];
+
+// Si NO es admin, filtramos los productos por el área del usuario
+if ($currentRole !== ROLES['ADMIN']) {
+    $areaFilter = " AND p.id_area = :user_area_id ";
+    $params[':user_area_id'] = $_SESSION['user_area_id'];
+}
 
 $query = "SELECT 
             p.id_producto,
             p.nombre,
             p.sku,
-            p.stock,                     -- Aseguramos que traiga el stock
+            p.stock,
+            p.id_area,
             p.imagen_path,
-            p.precio_referencial AS precio, -- Le damos el alias 'precio' para que tu HTML lo entienda
-            prov.nombre AS nombre_proveedor
+            p.precio_referencial AS precio,
+            prov.nombre AS nombre_proveedor,
+            a.nombre_area
           FROM producto p
+          LEFT JOIN area a ON p.id_area = a.id_area
           LEFT JOIN producto_proveedor pp ON p.id_producto = pp.id_producto AND pp.proveedor_principal = 1
           LEFT JOIN proveedor prov ON pp.id_proveedor = prov.id_proveedor
-          WHERE p.nombre LIKE :search OR p.sku LIKE :search";
+          WHERE (p.nombre LIKE :search OR p.sku LIKE :search) $areaFilter";
 
 $stmt = $pdo->prepare($query);
-$params = [':search' => "%$searchTerm%"];
 $stmt->execute($params);
 $inventory = $stmt->fetchAll();
 
@@ -183,6 +195,10 @@ $movimientos = $pdo->query("
     LEFT JOIN area a_dest ON m.id_area = a_dest.id_area
     ORDER BY m.fecha DESC
 ")->fetchAll();
+
+
+$proveedores = $pdo->query("SELECT * FROM proveedor")->fetchAll();
+$productosOC = $pdo->query("SELECT id_producto, nombre, sku FROM producto")->fetchAll();
 
 function lucideIcon($name, $class = "w-5 h-5") {
     return "<i data-lucide='{$name}' class='{$class}'></i>";
@@ -221,10 +237,12 @@ function lucideIcon($name, $class = "w-5 h-5") {
             <?php endif; ?>
                 <a href="?tab=movements" class="flex items-center gap-3 p-3 rounded-xl <?= $activeTab === 'movements' ? 'bg-indigo-600/20 text-indigo-400 border border-indigo-500/20' : 'hover:bg-slate-800 text-slate-400' ?>">
                 <?= lucideIcon('history') ?> Movimientos
-            </a>
-                <a href="?tab=purchases" class="flex items-center gap-3 p-3 rounded-xl <?= $activeTab === 'purchases' ? 'bg-indigo-600/20 text-indigo-400' : 'hover:bg-slate-800 text-slate-400' ?>">
-                <?= lucideIcon('shopping-cart') ?> Órdenes de Compra
-            </a>
+            <?php if ($currentRole === ROLES['ADMIN'] || $currentRole === ROLES['ENCARGADO']): ?>
+                <a href="?tab=purchases" 
+                class="flex items-center gap-3 p-3 rounded-xl <?= $activeTab === 'purchases' ? 'bg-indigo-600/20 text-indigo-400 border border-indigo-500/20' : 'hover:bg-slate-800 text-slate-400' ?>">
+                    <?= lucideIcon('shopping-cart') ?> Órdenes de Compra
+                </a>
+            <?php endif; ?>
         </nav>
 
         <div class="p-6 border-t border-slate-800 text-xs text-slate-500">
@@ -316,14 +334,27 @@ function lucideIcon($name, $class = "w-5 h-5") {
 
                             <td class="px-8 py-5 text-right">
                                 <div class="flex justify-end gap-2">
-                                    <?php if ($currentRole !== ROLES['CONSULTOR']): ?>
-                                        <button onclick='openModal("edit", <?= json_encode($item) ?>)' class="p-2 hover:bg-indigo-500/20 text-slate-400 hover:text-indigo-400 rounded-xl">
+                                    <?php 
+                                    // Lógica de Permisos: 
+                                    // 1. Los Admin pueden editar cualquier cosa.
+                                    // 2. Los Encargados SOLO pueden editar si el producto es de su área.
+                                    $puedeEditar = ($currentRole === ROLES['ADMIN']) || 
+                                                ($currentRole === ROLES['ENCARGADO'] && $item['id_area'] == $_SESSION['user_area_id']);
+                                    ?>
+
+                                    <?php if ($puedeEditar): ?>
+                                        <a href="editar_producto.php?id=<?= $item['id_producto'] ?>" 
+                                        class="p-2 hover:bg-indigo-500/20 text-slate-400 hover:text-indigo-400 rounded-xl transition-all"
+                                        title="Editar Producto">
                                             <?= lucideIcon('edit-3', 'w-4 h-4') ?>
-                                        </button>
+                                        </a>
                                     <?php endif; ?>
                                     
                                     <?php if ($currentRole === ROLES['ADMIN']): ?>
-                                        <a href="?delete_id=<?= $item['id_producto'] ?>" onclick="return confirm('¿Eliminar?')" class="p-2 hover:bg-red-500/20 text-slate-400 hover:text-red-400 rounded-xl">
+                                        <a href="?delete_id=<?= $item['id_producto'] ?>" 
+                                        onclick="return confirm('¿Eliminar producto? Esta acción es permanente.')" 
+                                        class="p-2 hover:bg-red-500/20 text-slate-400 hover:text-red-400 rounded-xl transition-all"
+                                        title="Eliminar Producto">
                                             <?= lucideIcon('trash-2', 'w-4 h-4') ?>
                                         </a>
                                     <?php endif; ?>
@@ -552,7 +583,16 @@ function lucideIcon($name, $class = "w-5 h-5") {
                                 JOIN proveedor p ON oc.id_proveedor = p.id_proveedor
                                 JOIN area a ON oc.id_area = a.id_area")->fetchAll();
             ?>
-                <h1 class="text-3xl font-bold text-white mb-8">Órdenes de Compra</h1>
+            <div class="flex justify-between items-end mb-8">
+                <div>
+                    <h1 class="text-3xl font-bold text-white">Órdenes de Compra</h1>
+                    <p class="text-slate-500 italic">Gestión de adquisiciones y recepciones</p>
+                </div>
+                <button onclick="openOCModal()" class="bg-indigo-600 hover:bg-indigo-500 px-6 py-3 rounded-2xl font-bold flex items-center gap-2 shadow-lg shadow-indigo-600/20">
+                    <?= lucideIcon('plus') ?> Crear Orden
+                </button>
+            </div>
+
                 <div class="bg-slate-900 border border-slate-800 rounded-[2rem] overflow-hidden">
                     <table class="w-full text-left">
                         <thead class="bg-slate-800/50 text-slate-500 text-[10px] uppercase">
@@ -580,8 +620,128 @@ function lucideIcon($name, $class = "w-5 h-5") {
                                         <?= lucideIcon('external-link', 'w-5 h-5') ?>
                                     </a>
                                 </td>
+                                <td class="px-8 py-4 text-right">
+                                    <div class="flex justify-end gap-3">
+                                        
+                                        <?php if ($c['estado_oc'] === 'Aceptada'): ?>
+                                            <button onclick="openReceiptModal(<?= $c['id_orden_compra'] ?>)" 
+                                                    class="flex items-center gap-2 px-4 py-2 bg-emerald-600/20 text-emerald-400 hover:bg-emerald-600 hover:text-white rounded-xl font-bold transition-all border border-emerald-500/20">
+                                                <?= lucideIcon('package-check') ?> Recepcionar
+                                            </button>
+                                        <?php endif; ?>
+
+                                        <a href="print_oc.php?id=<?= $c['id_orden_compra'] ?>" target="_blank" class="text-slate-400 hover:text-white">
+                                            <?= lucideIcon('external-link', 'w-5 h-5') ?>
+                                        </a>
+                                    </div>
+                                </td>
+                                <td class="px-8 py-4 text-right">
+                                    <div class="flex justify-end gap-3">
+                                        <?php if ($c['estado_oc'] === 'Aceptada'): ?>
+                                            <button onclick="openReceiptModal(<?= $c['id_orden_compra'] ?>)" 
+                                                    class="flex items-center gap-2 px-4 py-2 bg-emerald-600/20 text-emerald-400 hover:bg-emerald-600 hover:text-white rounded-xl font-bold transition-all border border-emerald-500/20">
+                                                <?= lucideIcon('package-check') ?> Recepcionar
+                                            </button>
+                                        <?php endif; ?>
+
+                                        <a href="print_oc.php?id=<?= $c['id_orden_compra'] ?>" target="_blank" class="text-slate-400 hover:text-white">
+                                            <?= lucideIcon('external-link', 'w-5 h-5') ?>
+                                        </a>
+                                    </div>
+                                </td>
                             </tr>
                             <?php endforeach; ?>
+                        <div id="ocModal" class="hidden fixed inset-0 bg-black/80 backdrop-blur-md z-[70] flex items-center justify-center p-4">
+                            <div class="bg-slate-900 border border-slate-800 p-8 rounded-[2.5rem] w-full max-w-3xl shadow-2xl max-h-[90vh] overflow-y-auto">
+                                <h2 class="text-2xl font-bold mb-6 text-white flex items-center gap-2">
+                                    <?= lucideIcon('shopping-basket') ?> Nueva Orden de Compra
+                                </h2>
+                                
+                                <form action="save_oc.php" method="POST" class="space-y-6">
+                                    <div class="grid grid-cols-1 md:grid-cols-3 gap-4">
+                                        <div>
+                                            <label class="text-[10px] font-bold text-slate-500 uppercase ml-1">Proveedor</label>
+                                            <select name="id_proveedor" required class="w-full bg-slate-800 border border-slate-700 rounded-2xl px-4 py-3 outline-none focus:ring-2 focus:ring-indigo-500">
+                                                <?php foreach($proveedores as $p): ?>
+                                                    <option value="<?= $p['id_proveedor'] ?>"><?= htmlspecialchars($p['nombre']) ?></option>
+                                                <?php endforeach; ?>
+                                            </select>
+                                        </div>
+                                        <div>
+                                            <label class="text-[10px] font-bold text-slate-500 uppercase ml-1">Número de OC</label>
+                                            <input type="text" name="numero_oc" required placeholder="OC-0001" class="w-full bg-slate-800 border border-slate-700 rounded-2xl px-4 py-3 outline-none">
+                                        </div>
+                                        <div>
+                                            <label class="text-[10px] font-bold text-slate-500 uppercase ml-1">Tipo Presupuesto</label>
+                                            <input type="text" name="tipo_presupuesto" placeholder="Ej: Salud" class="w-full bg-slate-800 border border-slate-700 rounded-2xl px-4 py-3 outline-none">
+                                        </div>
+                                    </div>
+
+                                    <div class="border-t border-slate-800 pt-6">
+                                        <div class="flex justify-between items-center mb-4">
+                                            <h3 class="text-sm font-bold text-slate-400 uppercase tracking-widest">Productos de la Orden</h3>
+                                            <button type="button" onclick="addProductRow()" class="text-xs bg-indigo-600/20 text-indigo-400 px-3 py-1 rounded-lg border border-indigo-500/30 hover:bg-indigo-600 hover:text-white transition-all">
+                                                + Agregar Fila
+                                            </button>
+                                        </div>
+                                        
+                                        <div id="addProductModal" class="hidden fixed inset-0 bg-black/80 backdrop-blur-sm z-[100] flex items-center justify-center p-4">
+                                            <div class="bg-slate-900 p-8 rounded-[2.5rem] border border-slate-800 w-full max-w-md shadow-2xl">
+                                                <h2 class="text-2xl font-bold text-white mb-6">Nuevo Producto</h2>
+                                                
+                                                <form action="index.php" method="POST" enctype="multipart/form-data" class="space-y-6">
+                                                    <input type="hidden" name="action" value="add">
+                                                    
+                                                    <div>
+                                                        <label class="block text-[10px] font-bold uppercase text-slate-500 mb-2 ml-1">Nombre</label>
+                                                        <input type="text" name="nombre" required placeholder="Ej: Escritorio Ergonómico" 
+                                                            class="w-full bg-slate-800 border border-slate-700 rounded-2xl px-5 py-3 outline-none focus:ring-2 focus:ring-indigo-500 text-white">
+                                                    </div>
+
+                                                    <div>
+                                                        <label class="block text-[10px] font-bold uppercase text-slate-500 mb-2 ml-1">Imagen</label>
+                                                        <input type="file" name="imagen" class="w-full text-xs text-slate-400 file:mr-4 file:py-2 file:px-4 file:rounded-full file:border-0 file:text-xs file:font-semibold file:bg-indigo-600 file:text-white hover:file:bg-indigo-500">
+                                                    </div>
+
+                                                    <div class="grid grid-cols-2 gap-4">
+                                                        <div>
+                                                            <label class="block text-[10px] font-bold uppercase text-slate-500 mb-2 ml-1">Precio</label>
+                                                            <input type="number" step="0.01" name="precio" placeholder="0.00" required 
+                                                                class="w-full bg-slate-800 border border-slate-700 rounded-2xl px-5 py-3 outline-none focus:ring-2 focus:ring-indigo-500 text-white">
+                                                        </div>
+                                                        <div>
+                                                            <label class="block text-[10px] font-bold uppercase text-slate-500 mb-2 ml-1">Stock Inicial</label>
+                                                            <input type="number" name="stock" placeholder="0" required 
+                                                                    class="w-full bg-slate-800 border border-slate-700 rounded-2xl px-5 py-3 outline-none focus:ring-2 focus:ring-indigo-500 text-white">
+                                                        </div>
+                                                    </div>
+
+                                                    <div>
+                                                        <label class="block text-[10px] font-bold uppercase text-slate-500 mb-2 ml-1">Área Municipal</label>
+                                                        <select name="id_area" class="w-full bg-slate-800 border border-slate-700 rounded-2xl px-4 py-3 outline-none focus:ring-2 focus:ring-indigo-500 text-white">
+                                                            <?php foreach ($areasList as $area): ?>
+                                                                <option value="<?= $area['id_area'] ?>"><?= htmlspecialchars($area['nombre_area']) ?></option>
+                                                            <?php endforeach; ?>
+                                                        </select>
+                                                    </div>
+
+                                                    <div class="flex gap-4 pt-4">
+                                                        <button type="button" onclick="closeModal('add')" class="flex-1 text-slate-500 font-bold hover:text-white transition-colors">Cancelar</button>
+                                                        <button type="submit" class="flex-1 bg-indigo-600 hover:bg-indigo-500 py-4 rounded-2xl font-bold text-white shadow-lg shadow-indigo-600/20">Guardar</button>
+                                                    </div>
+                                                </form>
+                                            </div>
+                                        </div>
+
+                                    <div class="flex gap-4 pt-4">
+                                        <button type="button" onclick="closeOCModal()" class="flex-1 text-slate-500 font-bold hover:text-white">Cancelar</button>
+                                        <button type="submit" class="flex-1 bg-indigo-600 py-4 rounded-2xl font-bold hover:bg-indigo-500 shadow-lg shadow-indigo-600/20">
+                                            Generar Orden Pendiente
+                                        </button>
+                                    </div>
+                                </form>
+                            </div>
+                        </div>
                         </tbody>
                     </table>
                 </div>
@@ -612,19 +772,16 @@ function lucideIcon($name, $class = "w-5 h-5") {
             </div>
 
             <div class="grid grid-cols-2 gap-4">
-                <input type="text" name="sku" id="p_sku" placeholder="SKU" required class="bg-slate-800 border border-slate-700 rounded-2xl px-5 py-3 outline-none">
-                <input type="number" step="0.01" name="precio" id="p_precio" placeholder="Precio" required class="bg-slate-800 border border-slate-700 rounded-2xl px-5 py-3 outline-none">
-            </div>
-
-            <div class="grid grid-cols-2 gap-4">
+                <input type="number" step="0.01" name="precio" id="p_precio" placeholder="Precio" required class="bg-slate-800 border border-slate-700 rounded-2xl px-5 py-3 outline-none">                
                 <input type="number" name="stock" id="p_stock" placeholder="Stock" required class="bg-slate-800 border border-slate-700 rounded-2xl px-5 py-3 outline-none">
-                <select name="id_area" id="p_area" class="bg-slate-800 border border-slate-700 rounded-2xl px-5 py-3 outline-none">
+            </div>
+            <div>
+                <select name="id_area" id="p_area" class="w-full bg-slate-800 border border-slate-700 rounded-2xl px-5 py-3 outline-none">
                     <?php foreach ($areasList as $a): ?>
                         <option value="<?= $a['id_area'] ?>"><?= $a['nombre_area'] ?></option>
                     <?php endforeach; ?>
                 </select>
             </div>
-
             <div class="flex gap-4 pt-4">
                 <button type="button" onclick="closeModal()" class="flex-1 text-slate-500 font-bold hover:text-white">Cancelar</button>
                 <button type="submit" class="flex-1 bg-indigo-600 py-3 rounded-2xl font-bold hover:bg-indigo-500 shadow-lg shadow-indigo-600/20">Guardar</button>
@@ -676,7 +833,89 @@ function lucideIcon($name, $class = "w-5 h-5") {
     document.getElementById('movementModal').addEventListener('click', (e) => {
         if (e.target.id === 'movementModal') closeMovementModal();
     });
+    let rowCount = 1;
+
+    function openOCModal() {
+        document.getElementById('ocModal').classList.remove('hidden');
+    }
+
+    function closeOCModal() {
+        document.getElementById('ocModal').classList.add('hidden');
+    }
+
+    function addProductRow() {
+        const container = document.getElementById('productRows');
+        const newRow = document.createElement('div');
+        newRow.className = "grid grid-cols-12 gap-3 items-center bg-slate-800/30 p-3 rounded-2xl border border-slate-800 animate-in fade-in slide-in-from-top-2";
+        
+        // Usamos el HTML de la primera fila pero actualizamos el índice rowCount
+        newRow.innerHTML = `
+            <div class="col-span-6">
+                <select name="items[${rowCount}][id_producto]" required class="w-full bg-slate-900 border border-slate-700 rounded-xl px-3 py-2 text-sm outline-none">
+                    ${document.querySelector('#productRows select').innerHTML}
+                </select>
+            </div>
+            <div class="col-span-3">
+                <input type="number" name="items[${rowCount}][cantidad]" placeholder="Cant." min="1" required class="w-full bg-slate-900 border border-slate-700 rounded-xl px-3 py-2 text-sm outline-none">
+            </div>
+            <div class="col-span-2">
+                <input type="number" step="0.01" name="items[${rowCount}][precio]" placeholder="Precio" required class="w-full bg-slate-900 border border-slate-700 rounded-xl px-3 py-2 text-sm outline-none">
+            </div>
+            <div class="col-span-1 text-right">
+                <button type="button" onclick="this.parentElement.parentElement.remove()" class="text-red-500 hover:text-red-400">
+                    ${lucide.createIcons() || '✕'}
+                </button>
+            </div>
+        `;
+        container.appendChild(newRow);
+        rowCount++;
+        lucide.createIcons(); // Para que el icono de eliminar se dibuje
+    }
+    function openReceiptModal(id) {
+    document.getElementById('receipt_id_oc').value = id;
+    document.getElementById('receiptModal').classList.remove('hidden');
+    }
+
+    function closeReceiptModal() {
+        document.getElementById('receiptModal').classList.add('hidden');
+    }
+
+    function updateFileName(input) {
+        const fileName = input.files[0] ? input.files[0].name : "No se ha seleccionado archivo";
+        document.getElementById('fileName').textContent = fileName;
+    }
 </script>
+<div id="receiptModal" class="hidden fixed inset-0 bg-black/80 backdrop-blur-md z-[80] flex items-center justify-center p-4">
+    <div class="bg-slate-900 border border-slate-800 p-8 rounded-[2.5rem] w-full max-w-md shadow-2xl">
+        <h2 class="text-2xl font-bold mb-2 text-white flex items-center gap-2">
+            <?= lucideIcon('file-up') ?> Recepcionar Mercadería
+        </h2>
+        <p class="text-slate-500 text-sm mb-6">Sube el respaldo de la compra para ingresar los productos al inventario.</p>
+        
+        <form action="recepcionar_oc.php" method="POST" enctype="multipart/form-data" class="space-y-5">
+            <input type="hidden" name="id_orden_compra" id="receipt_id_oc">
+            
+            <div class="bg-slate-800/50 p-6 rounded-2xl border-2 border-dashed border-slate-700 hover:border-indigo-500 transition-colors group">
+                <label class="cursor-pointer flex flex-col items-center gap-3">
+                    <div class="p-3 bg-slate-800 rounded-xl group-hover:bg-indigo-600/20 group-hover:text-indigo-400 transition-all">
+                        <?= lucideIcon('upload-cloud', 'w-8 h-8') ?>
+                    </div>
+                    <span class="text-xs font-bold text-slate-400 uppercase tracking-widest">Seleccionar Boleta/Factura</span>
+                    <input type="file" name="boleta" accept="image/*,.pdf" required class="hidden" onchange="updateFileName(this)">
+                    <span id="fileName" class="text-[10px] text-indigo-400 italic">No se ha seleccionado archivo</span>
+                </label>
+            </div>
+
+            <div class="flex gap-4 pt-2">
+                <button type="button" onclick="closeReceiptModal()" class="flex-1 text-slate-500 font-bold hover:text-white transition-colors">Cancelar</button>
+                <button type="submit" class="flex-1 bg-emerald-600 py-3 rounded-2xl font-bold text-white hover:bg-emerald-500 shadow-lg shadow-emerald-600/20 transition-all">
+                    Confirmar Ingreso
+                </button>
+            </div>
+        </form>
+    </div>
+</div>
+
 </body>
 </html>
  
