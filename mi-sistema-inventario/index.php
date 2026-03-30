@@ -6,14 +6,12 @@ if (!isset($_SESSION['user_id'])) {
     exit;
 }
 
-// 2. Validar tiempo de inactividad
+// 1. Validar tiempo de inactividad
 require_once 'check_session.php';
 
 header("Cache-Control: no-cache, no-store, must-revalidate"); // HTTP 1.1.
 header("Pragma: no-cache"); // HTTP 1.0.
 header("Expires: 0"); // Proxies.
-
-
 
 // 2. Configuración de Roles y Sesión
 $currentRole   = $_SESSION['user_rol']; 
@@ -39,7 +37,6 @@ if (isset($_GET['error']) && $_GET['error'] === 'timeout') {
     $error = "Tu sesión ha expirado por inactividad. Por favor, ingresa nuevamente.";
 }
 
-
 // 3. Conexión a Base de Datos
 $host = 'localhost';
 $db   = 'stockmaster_db';
@@ -55,11 +52,109 @@ try {
     die("Error de conexión: " . $e->getMessage());
 }
 
+// --- OBTENER TASAS DE CAMBIO INTERNACIONALES EN TIEMPO REAL ---
+// Valores de respaldo por defecto en caso de que la API externa falle
+$tasasCambio = [
+    'CLP' => 1,
+    'USD' => 950,
+    'EUR' => 1050,
+    'CNY' => 130 // Yuan Chino
+];
+
+try {
+    // Usamos exchangerate-api para obtener todas las monedas basadas en USD
+    $ch = curl_init('https://api.exchangerate-api.com/v4/latest/USD');
+    curl_setopt($ch, CURLOPT_RETURNTRANSFER, true);
+    curl_setopt($ch, CURLOPT_TIMEOUT, 3); // 3 segundos de espera máximo
+    $response = curl_exec($ch);
+    curl_close($ch);
+    
+    if ($response) {
+        $data = json_decode($response, true);
+        if (isset($data['rates']['CLP'])) {
+            $clpRate = $data['rates']['CLP'];
+            $tasasCambio['USD'] = $clpRate; // 1 USD = X CLP
+            
+            // Calcular conversiones cruzadas hacia CLP
+            if(isset($data['rates']['EUR'])) {
+                $tasasCambio['EUR'] = $clpRate / $data['rates']['EUR'];
+            }
+            if(isset($data['rates']['CNY'])) {
+                $tasasCambio['CNY'] = $clpRate / $data['rates']['CNY'];
+            }
+        }
+    }
+} catch (Exception $e) {}
+
+// --- MOTOR DE ANÁLISIS DE LINKS Y REGLAS DE IMPORTACIÓN ---
+function analizarLinkImportacion($url) {
+    if (empty($url)) return ['es_importado' => 0, 'moneda' => 'CLP'];
+
+    $domain = parse_url($url, PHP_URL_HOST);
+    if (!$domain) return ['es_importado' => 0, 'moneda' => 'CLP'];
+    
+    // Reglas Automáticas por Dominio (Se detecta la tienda y se asigna su moneda local)
+    $reglas = [
+        'alibaba.com'   => ['es_importado' => 1, 'moneda' => 'CNY'], // Yuan Chino
+        'aliexpress.com'=> ['es_importado' => 1, 'moneda' => 'USD'], // Por lo general se tranza en USD
+        'amazon.com'    => ['es_importado' => 1, 'moneda' => 'USD'],
+        'amazon.es'     => ['es_importado' => 1, 'moneda' => 'EUR'], // Amazon España
+        'ebay.com'      => ['es_importado' => 1, 'moneda' => 'USD'],
+        'apple.com'     => ['es_importado' => 1, 'moneda' => 'USD'],
+        'pcfactory.cl'  => ['es_importado' => 0, 'moneda' => 'CLP'],
+        'mercadolibre.cl'=> ['es_importado' => 0, 'moneda' => 'CLP'],
+    ];
+
+    foreach ($reglas as $key => $valores) {
+        if (strpos($domain, $key) !== false) {
+            return $valores;
+        }
+    }
+
+    // Por defecto asume Nacional
+    return ['es_importado' => 0, 'moneda' => 'CLP'];
+}
+
+// --- FUNCIÓN DE CÁLCULO MUNICIPAL / ADUANERO MULTIMONEDA ---
+function calcularCostosAdquisicion($precioBase, $monedaOrigen, $esImportado, $tasas) {
+    $iva = 0.19; // 19% IVA Chile
+    $arancel_aduanero = 0.06; // 6% Ad Valorem
+
+    // Estandarizar base a CLP multiplicando por la tasa de la moneda origen
+    $tasaAplicada = $tasas[$monedaOrigen] ?? 1;
+    $baseCLP = $precioBase * $tasaAplicada;
+    
+    // Arancel Aduanero (Aplica solo si es importado)
+    $costoArancelCLP = $esImportado ? ($baseCLP * $arancel_aduanero) : 0;
+    
+    // Subtotal CIF
+    $subtotalCLP = $baseCLP + $costoArancelCLP;
+    
+    // IVA
+    $montoIvaCLP = $subtotalCLP * $iva;
+    
+    // Totales
+    $totalCLP = $subtotalCLP + $montoIvaCLP;
+    $totalUSD = $totalCLP / $tasas['USD']; // Para referencia internacional
+
+    return [
+        'precio_origen' => $precioBase,
+        'moneda_origen' => $monedaOrigen,
+        'tasa_aplicada' => $tasaAplicada,
+        'base_clp'      => $baseCLP,
+        'arancel_clp'   => $costoArancelCLP,
+        'iva_clp'       => $montoIvaCLP,
+        'total_clp'     => $totalCLP,
+        'total_usd'     => $totalUSD,
+        'es_importado'  => $esImportado
+    ];
+}
+
 // --- 4. ACCIONES BACKEND ---
 
 // Eliminar Producto
 if (isset($_GET['delete_id']) && $currentRole === ROLES['ADMIN']) {
-    $stmt = $pdo->prepare("DELETE FROM PRODUCTO WHERE id_producto = ?");
+    $stmt = $pdo->prepare("DELETE FROM producto WHERE id_producto = ?");
     $stmt->execute([$_GET['delete_id']]);
     header("Location: index.php?tab=$activeTab");
     exit;
@@ -67,11 +162,19 @@ if (isset($_GET['delete_id']) && $currentRole === ROLES['ADMIN']) {
 
 // Agregar o Editar Producto
 if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['action']) && $currentRole !== ROLES['CONSULTOR']) {
-    $nombre  = $_POST['nombre'];
-    $sku     = $_POST['sku'];
-    $stock   = $_POST['stock'];
-    $precio  = $_POST['precio'];
-    $id_area = $_POST['id_area'];
+    $nombre        = $_POST['nombre'];
+    $sku           = $_POST['sku'];
+    $stock         = $_POST['stock'];
+    $precio        = $_POST['precio'];
+    $id_area       = $_POST['id_area'];
+    $url_producto  = trim($_POST['producto_url'] ?? '');
+    
+    // Analizar Link para Auto-Detección
+    $infoLink = analizarLinkImportacion($url_producto);
+    
+    // Si hay link, domina el link, sino, toma los valores manuales del formulario
+    $moneda_origen = !empty($url_producto) ? $infoLink['moneda'] : ($_POST['moneda_origen'] ?? 'CLP');
+    $es_importado  = !empty($url_producto) ? $infoLink['es_importado'] : (isset($_POST['es_importado']) ? 1 : 0);
     
     // Lógica de imagen
     $imagenPath = $_POST['current_image_path'] ?? null;
@@ -86,45 +189,37 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['action']) && $current
     }
 
     if ($_POST['action'] === 'add' && $currentRole === ROLES['ADMIN']) {
-        $stmt = $pdo->prepare("INSERT INTO PRODUCTO (nombre, sku, stock, precio, id_area, imagen_path, estado) VALUES (?, ?, ?, ?, ?, ?, 'Activo')");
-        $stmt->execute([$nombre, $sku, $stock, $precio, $id_area, $imagenPath]);
+        $stmt = $pdo->prepare("INSERT INTO producto (nombre, sku, stock, precio_referencial, id_area, imagen_path, estado, moneda_origen, es_importado, producto_url) VALUES (?, ?, ?, ?, ?, ?, 'activo', ?, ?, ?)");
+        $stmt->execute([$nombre, $sku, $stock, $precio, $id_area, $imagenPath, $moneda_origen, $es_importado, $url_producto]);
     } elseif ($_POST['action'] === 'edit' && isset($_POST['id_producto'])) {
-        $stmt = $pdo->prepare("UPDATE PRODUCTO SET nombre=?, sku=?, stock=?, precio=?, id_area=?, imagen_path=? WHERE id_producto=?");
-        $stmt->execute([$nombre, $sku, $stock, $precio, $id_area, $imagenPath, $_POST['id_producto']]);
+        $stmt = $pdo->prepare("UPDATE producto SET nombre=?, sku=?, stock=?, precio_referencial=?, id_area=?, imagen_path=?, moneda_origen=?, es_importado=?, producto_url=? WHERE id_producto=?");
+        $stmt->execute([$nombre, $sku, $stock, $precio, $id_area, $imagenPath, $moneda_origen, $es_importado, $url_producto, $_POST['id_producto']]);
     }
     header("Location: index.php?tab=$activeTab");
     exit;
 }
-if (
-    $_SERVER['REQUEST_METHOD'] === 'POST' &&
-    isset($_POST['update_role']) &&
-    $currentRole === ROLES['ADMIN']
-) {
-    $stmt = $pdo->prepare("
-        UPDATE USUARIO 
-        SET id_rol = ?
-        WHERE id_usuario = ?
-    ");
-    $stmt->execute([
-        $_POST['id_rol'],
-        $_POST['id_usuario']
-    ]);
+
+if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['update_role']) && $currentRole === ROLES['ADMIN']) {
+    $stmt = $pdo->prepare("UPDATE usuario SET id_rol = ? WHERE id_usuario = ?");
+    $stmt->execute([$_POST['id_rol'], $_POST['id_usuario']]);
 }
 
-
-
 // 5. CONSULTA DE DATOS ACTUALIZADA
-
-
 $query = "SELECT 
             p.id_producto,
             p.nombre,
             p.sku,
-            p.stock,                     -- Aseguramos que traiga el stock
+            p.stock,
             p.imagen_path,
-            p.precio_referencial AS precio, -- Le damos el alias 'precio' para que tu HTML lo entienda
-            prov.nombre AS nombre_proveedor
+            p.precio_referencial AS precio,
+            p.moneda_origen,
+            p.es_importado,
+            p.producto_url,
+            p.id_area,
+            prov.nombre AS nombre_proveedor,
+            a.nombre_area
           FROM producto p
+          LEFT JOIN area a ON p.id_area = a.id_area
           LEFT JOIN producto_proveedor pp ON p.id_producto = pp.id_producto AND pp.proveedor_principal = 1
           LEFT JOIN proveedor prov ON pp.id_proveedor = prov.id_proveedor
           WHERE p.nombre LIKE :search OR p.sku LIKE :search";
@@ -134,15 +229,14 @@ $params = [':search' => "%$searchTerm%"];
 $stmt->execute($params);
 $inventory = $stmt->fetchAll();
 
-$areasList = $pdo->query("SELECT * FROM AREA")->fetchAll();
+$areasList = $pdo->query("SELECT * FROM area")->fetchAll();
 
 $users = $pdo->query("
     SELECT u.id_usuario, u.nombre, u.email, u.id_rol, r.nombre_rol
-    FROM USUARIO u
-    JOIN ROL r ON u.id_rol = r.id_rol
+    FROM usuario u
+    JOIN rol r ON u.id_rol = r.id_rol
 ")->fetchAll();
 
-// En la sección de consultas de tu PHP, reemplaza la consulta de movimientos:
 $movimientos = $pdo->query("
     SELECT 
         m.id_movimiento,
@@ -150,14 +244,14 @@ $movimientos = $pdo->query("
         m.fecha,
         m.motivo,
         u.nombre AS usuario,
-        a.nombre_area AS area_destino, -- Agregamos el área
+        a.nombre_area AS area_destino,
         p.nombre AS producto,
         d.cantidad
     FROM movimiento m
     JOIN detalle_movimiento d ON m.id_movimiento = d.id_movimiento
     JOIN producto p ON d.id_producto = p.id_producto
     JOIN usuario u ON m.id_usuario = u.id_usuario
-    LEFT JOIN area a ON m.id_area = a.id_area -- Relacionamos con el área
+    LEFT JOIN area a ON m.id_area = a.id_area
     ORDER BY m.fecha DESC
 ")->fetchAll();
 
@@ -199,7 +293,7 @@ function lucideIcon($name, $class = "w-5 h-5") {
                 <a href="?tab=movements" class="flex items-center gap-3 p-3 rounded-xl <?= $activeTab === 'movements' ? 'bg-indigo-600/20 text-indigo-400 border border-indigo-500/20' : 'hover:bg-slate-800 text-slate-400' ?>">
                 <?= lucideIcon('history') ?> Movimientos
             </a>
-                <a href="?tab=purchases" class="flex items-center gap-3 p-3 rounded-xl <?= $activeTab === 'purchases' ? 'bg-indigo-600/20 text-indigo-400' : 'hover:bg-slate-800 text-slate-400' ?>">
+                <a href="?tab=purchases" class="flex items-center gap-3 p-3 rounded-xl <?= $activeTab === 'purchases' ? 'bg-indigo-600/20 text-indigo-400 border border-indigo-500/20' : 'hover:bg-slate-800 text-slate-400' ?>">
                 <?= lucideIcon('shopping-cart') ?> Órdenes de Compra
             </a>
         </nav>
@@ -228,7 +322,6 @@ function lucideIcon($name, $class = "w-5 h-5") {
 
         <?php if ($activeTab === 'inventory'): ?>
 
-            <!-- ================= INVENTARIO ================= -->
             <div class="flex justify-between items-end mb-8">
                 <div>
                     <h1 class="text-3xl font-bold text-white">Inventario Actual</h1>
@@ -249,7 +342,7 @@ function lucideIcon($name, $class = "w-5 h-5") {
                             <th class="px-8 py-5">Imagen</th>
                             <th class="px-6 py-5">Producto / SKU</th>
                             <th class="px-6 py-5 text-center">Área</th>
-                            <th class="px-6 py-5 text-center">Precio</th>
+                            <th class="px-6 py-5 text-center">Valor Total CDP</th>
                             <th class="px-6 py-5 text-center">Stock</th>
                             <?php if (in_array($currentRole, [ROLES['ADMIN'], ROLES['ENCARGADO']])): ?>
                                 <th class="px-6 py-5 text-center">Proveedor</th>
@@ -269,8 +362,15 @@ function lucideIcon($name, $class = "w-5 h-5") {
                             </td>
 
                             <td class="px-6 py-5">
-                                <div class="font-bold text-slate-200"><?= htmlspecialchars($item['nombre']) ?></div>
-                                <div class="text-[11px] text-slate-500 font-mono"><?= $item['sku'] ?></div>
+                                <div class="flex items-center gap-2">
+                                    <div class="font-bold text-slate-200"><?= htmlspecialchars($item['nombre']) ?></div>
+                                    <?php if(!empty($item['producto_url'])): ?>
+                                        <a href="<?= htmlspecialchars($item['producto_url']) ?>" target="_blank" class="text-blue-400 hover:text-blue-300 transition-colors" title="Ver producto original">
+                                            <?= lucideIcon('external-link', 'w-3 h-3') ?>
+                                        </a>
+                                    <?php endif; ?>
+                                </div>
+                                <div class="text-[11px] text-slate-500 font-mono mt-0.5"><?= $item['sku'] ?></div>
                             </td>
 
                             <td class="px-6 py-5 text-center">
@@ -279,8 +379,21 @@ function lucideIcon($name, $class = "w-5 h-5") {
                                 </span>
                             </td>
 
-                            <td class="px-6 py-5 text-center font-mono text-indigo-400">
-                                $<?= number_format($item['precio'] ?? 0, 2) ?>
+                            <td class="px-6 py-5 text-center">
+                                <?php 
+                                    $esImportado = $item['es_importado'] ?? 0;
+                                    $monedaOrigen = $item['moneda_origen'] ?? 'CLP';
+                                    $costos = calcularCostosAdquisicion($item['precio'], $monedaOrigen, $esImportado, $tasasCambio);
+                                ?>
+                                <div class="font-bold text-indigo-400 text-sm">
+                                    $<?= number_format($costos['total_clp'], 0, ',', '.') ?> CLP
+                                </div>
+                                <div class="text-[11px] text-slate-400 font-mono mt-0.5" title="Conversión de <?= $monedaOrigen ?>">
+                                    Ref: USD $<?= number_format($costos['total_usd'], 2, '.', ',') ?>
+                                </div>
+                                <button onclick='abrirModalDesglose(<?= json_encode($costos) ?>)' class="mt-2 mx-auto text-[10px] bg-slate-800 text-slate-400 hover:text-white px-2 py-1 rounded-md border border-slate-700 flex items-center gap-1 transition-colors">
+                                    <?= lucideIcon('calculator', 'w-3 h-3') ?> Ver Desglose
+                                </button>
                             </td>
 
                             <td class="px-6 py-5 text-center font-bold <?= ($item['stock'] ?? 0) < 10 ? 'text-red-500' : 'text-emerald-400' ?>">
@@ -314,13 +427,12 @@ function lucideIcon($name, $class = "w-5 h-5") {
 
         <?php elseif ($activeTab === 'statistics'): ?>
 
-            <!-- ================= ESTADÍSTICAS ================= -->
             <h1 class="text-3xl font-bold text-white mb-2">Estadísticas</h1>
             <p class="text-slate-500 mb-8">Resumen general del inventario</p>
 
             <div class="grid grid-cols-1 md:grid-cols-3 gap-6">
                 <div class="bg-slate-900 border border-slate-800 rounded-2xl p-6">
-                    <p class="text-slate-400 text-sm">vaiedad de Productos</p>
+                    <p class="text-slate-400 text-sm">Variedad de Productos</p>
                     <p class="text-3xl font-bold text-indigo-400"><?= count($inventory) ?></p>
                 </div>
 
@@ -332,16 +444,15 @@ function lucideIcon($name, $class = "w-5 h-5") {
                 </div>
 
                 <div class="bg-slate-900 border border-slate-800 rounded-2xl p-6">
-                    <p class="text-slate-400 text-sm">Valor Total</p>
+                    <p class="text-slate-400 text-sm">Valor Total Neto (Referencial)</p>
                     <p class="text-3xl font-bold text-emerald-400">
                         $
-                        <?= number_format(array_sum(array_map(fn($i) => $i['precio'] * $i['stock'], $inventory)), 0) ?>
+                        <?= number_format(array_sum(array_map(fn($i) => $i['precio'] * $i['stock'], $inventory)), 0, ',', '.') ?>
                     </p>
                 </div>
             </div>
         <?php elseif ($activeTab === 'roles' && $currentRole === ROLES['ADMIN']): ?>
 
-            <!-- ================= GESTIÓN DE ROLES ================= -->
             <div class="flex justify-between items-end mb-8">
                 <div>
                     <h1 class="text-3xl font-bold text-white">Gestión de Usuarios</h1>
@@ -482,7 +593,6 @@ function lucideIcon($name, $class = "w-5 h-5") {
     </div>
 </section>
 
-
 <div id="productModal" class="hidden fixed inset-0 bg-black/80 backdrop-blur-md z-50 flex items-center justify-center p-4">
     <div class="bg-slate-900 border border-slate-800 p-8 rounded-[2.5rem] w-full max-w-md">
         <h2 id="modalTitle" class="text-2xl font-bold mb-6 text-white">Producto</h2>
@@ -497,29 +607,120 @@ function lucideIcon($name, $class = "w-5 h-5") {
             </div>
 
             <div>
+                <label class="text-[10px] font-bold text-slate-500 uppercase ml-1">Link de Referencia (Auto-detecta Importación)</label>
+                <div class="relative">
+                    <input type="url" name="producto_url" id="p_url" placeholder="https://www.alibaba.com/..." class="w-full bg-slate-800 border border-slate-700 rounded-2xl pl-10 pr-5 py-3 outline-none focus:ring-2 focus:ring-blue-500 text-xs">
+                    <div class="absolute left-3 top-3.5 text-slate-500"><?= lucideIcon('link', 'w-4 h-4') ?></div>
+                </div>
+            </div>
+
+            <div>
                 <label class="text-[10px] font-bold text-slate-500 uppercase ml-1">Imagen</label>
                 <input type="file" name="imagen" accept="image/*" class="w-full bg-slate-800 border border-slate-700 rounded-2xl px-5 py-2 text-xs text-slate-400 file:bg-indigo-600 file:text-white file:border-0 file:rounded-lg file:px-2 file:py-1 file:mr-4">
             </div>
 
             <div class="grid grid-cols-2 gap-4">
-                <input type="text" name="sku" id="p_sku" placeholder="SKU" required class="bg-slate-800 border border-slate-700 rounded-2xl px-5 py-3 outline-none">
-                <input type="number" step="0.01" name="precio" id="p_precio" placeholder="Precio" required class="bg-slate-800 border border-slate-700 rounded-2xl px-5 py-3 outline-none">
+                <div>
+                    <label class="text-[10px] font-bold text-slate-500 uppercase ml-1">SKU</label>
+                    <input type="text" name="sku" id="p_sku" placeholder="Código" required class="w-full bg-slate-800 border border-slate-700 rounded-2xl px-5 py-3 outline-none focus:ring-2 focus:ring-indigo-500">
+                </div>
+                <div>
+                    <label class="text-[10px] font-bold text-slate-500 uppercase ml-1">Precio Neto</label>
+                    <input type="number" step="0.01" name="precio" id="p_precio" placeholder="0.00" required class="w-full bg-slate-800 border border-slate-700 rounded-2xl px-5 py-3 outline-none focus:ring-2 focus:ring-indigo-500">
+                </div>
+            </div>
+
+            <div class="grid grid-cols-2 gap-4 border-t border-slate-800 pt-4 mt-2">
+                <div>
+                    <label class="text-[10px] font-bold text-slate-500 uppercase ml-1">Moneda Origen</label>
+                    <select name="moneda_origen" id="p_moneda" class="w-full bg-slate-800 border border-slate-700 rounded-2xl px-5 py-3 outline-none focus:ring-2 focus:ring-indigo-500 text-sm">
+                        <option value="CLP">CLP (Pesos)</option>
+                        <option value="USD">USD (Dólares)</option>
+                        <option value="EUR">EUR (Euros)</option>
+                        <option value="CNY">CNY (Yuan)</option>
+                    </select>
+                </div>
+                <div class="flex items-center mt-6">
+                    <label class="flex items-center gap-2 cursor-pointer text-xs text-slate-300 font-medium">
+                        <input type="checkbox" name="es_importado" id="p_importado" value="1" class="w-5 h-5 rounded border-slate-700 bg-slate-800 text-indigo-600 focus:ring-indigo-500">
+                        <span>Aplica Arancel (6%)</span>
+                    </label>
+                </div>
             </div>
 
             <div class="grid grid-cols-2 gap-4">
-                <input type="number" name="stock" id="p_stock" placeholder="Stock" required class="bg-slate-800 border border-slate-700 rounded-2xl px-5 py-3 outline-none">
-                <select name="id_area" id="p_area" class="bg-slate-800 border border-slate-700 rounded-2xl px-5 py-3 outline-none">
-                    <?php foreach ($areasList as $a): ?>
-                        <option value="<?= $a['id_area'] ?>"><?= $a['nombre_area'] ?></option>
-                    <?php endforeach; ?>
-                </select>
+                <div>
+                    <label class="text-[10px] font-bold text-slate-500 uppercase ml-1">Stock</label>
+                    <input type="number" name="stock" id="p_stock" placeholder="0" required class="w-full bg-slate-800 border border-slate-700 rounded-2xl px-5 py-3 outline-none focus:ring-2 focus:ring-indigo-500">
+                </div>
+                <div>
+                    <label class="text-[10px] font-bold text-slate-500 uppercase ml-1">Área Destino</label>
+                    <select name="id_area" id="p_area" class="w-full bg-slate-800 border border-slate-700 rounded-2xl px-5 py-3 outline-none focus:ring-2 focus:ring-indigo-500 text-sm">
+                        <?php foreach ($areasList as $a): ?>
+                            <option value="<?= $a['id_area'] ?>"><?= $a['nombre_area'] ?></option>
+                        <?php endforeach; ?>
+                    </select>
+                </div>
             </div>
 
-            <div class="flex gap-4 pt-4">
-                <button type="button" onclick="closeModal()" class="flex-1 text-slate-500 font-bold hover:text-white">Cancelar</button>
-                <button type="submit" class="flex-1 bg-indigo-600 py-3 rounded-2xl font-bold hover:bg-indigo-500 shadow-lg shadow-indigo-600/20">Guardar</button>
+            <div class="flex gap-4 pt-4 border-t border-slate-800">
+                <button type="button" onclick="closeModal()" class="flex-1 text-slate-500 font-bold hover:text-white transition-colors">Cancelar</button>
+                <button type="submit" class="flex-1 bg-indigo-600 py-3 rounded-2xl font-bold hover:bg-indigo-500 shadow-lg shadow-indigo-600/20 transition-all">Guardar</button>
             </div>
         </form>
+    </div>
+</div>
+
+<div id="desgloseModal" class="hidden fixed inset-0 bg-black/80 backdrop-blur-md z-[110] flex items-center justify-center p-4">
+    <div class="bg-slate-900 border border-slate-800 p-8 rounded-[2rem] w-full max-w-md shadow-2xl">
+        <div class="flex items-center gap-3 mb-6">
+            <div class="bg-emerald-600/20 p-2 rounded-xl text-emerald-500">
+                <i data-lucide="landmark" class="w-6 h-6"></i>
+            </div>
+            <div>
+                <h2 class="text-xl font-bold text-white">Costos de Adquisición</h2>
+                <p class="text-[10px] text-slate-500 uppercase tracking-widest">Soporte Mercado Público (CDP)</p>
+            </div>
+        </div>
+
+        <div class="space-y-3 font-mono text-sm border-y border-slate-800 py-6 mb-6">
+            <div class="flex justify-between text-slate-400">
+                <span>Moneda Local y Valor:</span>
+                <span id="desc_origen_tasa" class="text-white"></span>
+            </div>
+            <div class="flex justify-between text-slate-400">
+                <span>Valor Neto Original:</span>
+                <span id="desc_origen" class="text-white font-bold"></span>
+            </div>
+            
+            <div class="flex justify-between text-slate-400 mt-4 border-t border-slate-800 pt-4">
+                <span>Valor Base (CLP):</span>
+                <span id="desc_base_clp" class="text-white"></span>
+            </div>
+
+            <div id="row_arancel" class="flex justify-between text-amber-500 hidden">
+                <span>Arancel Aduanero (6%):</span>
+                <span id="desc_arancel">+ $0</span>
+            </div>
+
+            <div class="flex justify-between text-indigo-400">
+                <span>IVA (19%):</span>
+                <span id="desc_iva">+ $0</span>
+            </div>
+        </div>
+
+        <div class="flex justify-between items-center text-lg font-bold text-emerald-400 mb-6 border-b border-slate-800 pb-6">
+            <span>TOTAL A PAGAR:</span>
+            <span id="desc_total_clp">$0 CLP</span>
+        </div>
+        
+        <div class="text-[10px] text-slate-500 italic mb-6">
+            * Valores calculados en tiempo real. 1 USD = <strong class="text-slate-300">$<?= number_format($tasasCambio['USD'], 2, ',', '.') ?> CLP</strong>.
+        </div>
+
+        <button type="button" onclick="document.getElementById('desgloseModal').classList.add('hidden')" class="w-full bg-slate-800 hover:bg-slate-700 text-white py-3 rounded-xl font-bold transition-colors">
+            Cerrar Desglose
+        </button>
     </div>
 </div>
 
@@ -539,11 +740,17 @@ function lucideIcon($name, $class = "w-5 h-5") {
             document.getElementById('p_precio').value = data.precio;
             document.getElementById('p_stock').value = data.stock;
             document.getElementById('p_area').value = data.id_area;
+            
+            document.getElementById('p_url').value = data.producto_url || '';
+            document.getElementById('p_moneda').value = data.moneda_origen || 'CLP';
+            document.getElementById('p_importado').checked = data.es_importado == 1;
         } else {
             document.getElementById('modalTitle').innerText = 'Nuevo Producto';
             document.getElementById('formAction').value = 'add';
             document.getElementById('productForm').reset();
             document.getElementById('productId').value = '';
+            document.getElementById('p_url').value = '';
+            document.getElementById('p_moneda').value = 'CLP';
         }
     }
 
@@ -553,6 +760,51 @@ function lucideIcon($name, $class = "w-5 h-5") {
 
     document.getElementById('productModal').addEventListener('click', (e) => {
         if (e.target.id === 'productModal') closeModal();
+    });
+
+    function formatearCLP(numero) {
+        return new Intl.NumberFormat('es-CL', { style: 'currency', currency: 'CLP' }).format(numero);
+    }
+
+    function abrirModalDesglose(costos) {
+        // Tasa y Moneda Original
+        const siglas = {
+            'USD': 'Dólares ($)',
+            'CNY': 'Yuan Chino (¥)',
+            'EUR': 'Euros (€)',
+            'CLP': 'Pesos Chilenos ($)'
+        };
+        const nombreMoneda = siglas[costos.moneda_origen] || costos.moneda_origen;
+        
+        document.getElementById('desc_origen_tasa').innerText = `1 ${costos.moneda_origen} = ${formatearCLP(costos.tasa_aplicada)}`;
+        document.getElementById('desc_origen').innerText = `${parseFloat(costos.precio_origen).toFixed(2)} ${costos.moneda_origen}`;
+        
+        // Base CLP
+        document.getElementById('desc_base_clp').innerText = formatearCLP(costos.base_clp);
+        
+        // Arancel
+        const rowArancel = document.getElementById('row_arancel');
+        if (costos.es_importado == 1) {
+            rowArancel.classList.remove('hidden');
+            document.getElementById('desc_arancel').innerText = '+ ' + formatearCLP(costos.arancel_clp);
+        } else {
+            rowArancel.classList.add('hidden');
+        }
+        
+        // IVA
+        document.getElementById('desc_iva').innerText = '+ ' + formatearCLP(costos.iva_clp);
+        
+        // Total
+        document.getElementById('desc_total_clp').innerText = formatearCLP(costos.total_clp);
+        
+        lucide.createIcons();
+        document.getElementById('desgloseModal').classList.remove('hidden');
+    }
+    
+    document.getElementById('desgloseModal').addEventListener('click', (e) => {
+        if (e.target.id === 'desgloseModal') {
+            document.getElementById('desgloseModal').classList.add('hidden');
+        }
     });
 </script>
 </body>
