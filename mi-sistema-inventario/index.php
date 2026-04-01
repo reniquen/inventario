@@ -59,10 +59,31 @@ try {
 
 // Eliminar Producto
 if (isset($_GET['delete_id']) && $currentRole === ROLES['ADMIN']) {
-    $stmt = $pdo->prepare("DELETE FROM PRODUCTO WHERE id_producto = ?");
-    $stmt->execute([$_GET['delete_id']]);
-    header("Location: index.php?tab=$activeTab");
-    exit;
+    $id_eliminar = $_GET['delete_id'];
+
+    try {
+        $pdo->beginTransaction();
+
+        // 1. Eliminar primero el stock en las áreas (Tabla hija)
+        $stmtStock = $pdo->prepare("DELETE FROM stock_area WHERE id_producto = ?");
+        $stmtStock->execute([$id_eliminar]);
+
+        // 2. Opcional: Si tienes detalles de movimientos o ventas, también debes borrarlos aquí
+        // $stmtMov = $pdo->prepare("DELETE FROM detalle_movimiento WHERE id_producto = ?");
+        // $stmtMov->execute([$id_eliminar]);
+
+        // 3. Finalmente, eliminar el producto (Tabla padre)
+        $stmtProd = $pdo->prepare("DELETE FROM producto WHERE id_producto = ?");
+        $stmtProd->execute([$id_eliminar]);
+
+        $pdo->commit();
+        header("Location: index.php?tab=$activeTab&success=deleted");
+        exit;
+
+    } catch (Exception $e) {
+        $pdo->rollBack();
+        die("Error al eliminar: " . $e->getMessage());
+    }
 }
 
 // Agregar o Editar Producto
@@ -90,7 +111,7 @@ if ($_POST['action'] === 'add' && $currentRole === ROLES['ADMIN']) {
         $pdo->beginTransaction();
 
         // 1. Insertamos el producto sin SKU todavía
-        $stmt = $pdo->prepare("INSERT INTO producto (nombre, stock, precio_referencial, imagen_path, estado, id_area) VALUES (?, 0, ?, ?, 'activo', ?)");
+        $stmt = $pdo->prepare("INSERT INTO producto (nombre, precio_referencial, imagen_path, estado, id_area) VALUES (?, 0, ?, ?, 'activo', ?)");
         $stmt->execute([$nombre, $precio, $imagenPath, $id_area]);
         
         $idNuevo = $pdo->lastInsertId();
@@ -101,7 +122,11 @@ if ($_POST['action'] === 'add' && $currentRole === ROLES['ADMIN']) {
         $stmtUpdate = $pdo->prepare("UPDATE producto SET sku = ? WHERE id_producto = ?");
         $stmtUpdate->execute([$nuevoCodigo, $idNuevo]);
 
-        // 3. Registrar el movimiento inicial de stock (Carga de inventario)
+        // 3. ¡NUEVO! Insertar stock inicial en la tabla stock_area
+        $stmtStock = $pdo->prepare("INSERT INTO stock_area (id_producto, id_area, cantidad) VALUES (?, ?, ?)");
+        $stmtStock->execute([$idNuevo, $id_area, $stock]);
+
+        // 4. Registrar el movimiento inicial de stock (Carga de inventario)
         $stmtMov = $pdo->prepare("INSERT INTO movimiento (id_usuario, tipo, motivo, id_area) VALUES (?, 'ENTRADA', 'Carga inicial automatizada', ?)");
         $stmtMov->execute([$_SESSION['user_id'], $id_area]);
         $idMov = $pdo->lastInsertId();
@@ -135,37 +160,44 @@ if (
 }
 
 
-
 // --- 5. CONSULTA DE DATOS CON FILTRO DE ÁREA ---
-
 $areaFilter = "";
 $params = [':search' => "%$searchTerm%"];
 
-// Si NO es admin, filtramos los productos por el área del usuario
 if ($currentRole !== ROLES['ADMIN']) {
-    $areaFilter = " AND p.id_area = :user_area_id ";
+    // Filtro para encargados: solo ven su área específica en stock_area
+    $areaFilter = " AND sa.id_area = :user_area_id ";
     $params[':user_area_id'] = $_SESSION['user_area_id'];
 }
 
 $query = "SELECT 
             p.id_producto,
-            p.nombre,
+            p.nombre, 
             p.sku,
-            p.stock,
+            p.stock,           
             p.id_area,
             p.imagen_path,
-            p.precio_referencial AS precio,
-            prov.nombre AS nombre_proveedor,
-            a.nombre_area
+            p.precio, 
+            p.id_orden_compra,
+            a.nombre_area,
+            prov.nombre AS nombre_proveedor 
           FROM producto p
           LEFT JOIN area a ON p.id_area = a.id_area
-          LEFT JOIN producto_proveedor pp ON p.id_producto = pp.id_producto AND pp.proveedor_principal = 1
-          LEFT JOIN proveedor prov ON pp.id_proveedor = prov.id_proveedor
-          WHERE (p.nombre LIKE :search OR p.sku LIKE :search) $areaFilter";
+          LEFT JOIN proveedor prov ON p.id_proveedor = prov.id_proveedor
+          WHERE (p.nombre LIKE :search OR p.sku LIKE :search) 
+          AND p.stock > 0 -- Solo mostramos lotes que tengan existencia
+          $areaFilter
+          ORDER BY p.nombre ASC, a.nombre_area ASC";
 
 $stmt = $pdo->prepare($query);
+// Asegúrate de que $params tenga el valor de :search (ej: '%')
 $stmt->execute($params);
-$inventory = $stmt->fetchAll();
+$inventory = $stmt->fetchAll(PDO::FETCH_ASSOC);
+$sqlCritico = "SELECT COUNT(*) FROM stock_area WHERE cantidad <= 5";
+if ($currentRole !== ROLES['ADMIN']) {
+    $sqlCritico .= " AND id_area = " . intval($_SESSION['user_area_id']);
+}
+$totalCritico = $pdo->query($sqlCritico)->fetchColumn();
 
 $areasList = $pdo->query("SELECT * FROM AREA")->fetchAll();
 
@@ -274,7 +306,11 @@ function lucideIcon($name, $class = "w-5 h-5") {
                 <div>
                     <h1 class="text-3xl font-bold text-white">Inventario Actual</h1>
                     <p class="text-slate-500 italic">Gestión de existencias por área</p>
+                    <a href="export_inventory.php" class="btn btn-success">
+                        <i class="bi bi-file-earmark-excel"></i> Descargar Inventario
+                    </a>
                 </div>
+                
 
                 <?php if ($currentRole === ROLES['ADMIN']): ?>
                     <button onclick="openModal('add')" class="bg-indigo-600 hover:bg-indigo-500 px-6 py-3 rounded-2xl font-bold flex items-center gap-2 shadow-lg shadow-indigo-600/20">
@@ -329,7 +365,7 @@ function lucideIcon($name, $class = "w-5 h-5") {
                             </td>
 
                             <td class="px-6 py-5 text-center text-slate-400 text-sm">
-                                <?= htmlspecialchars($item['nombre_proveedor'] ?? '—') ?>
+                                <?= htmlspecialchars($p['nombre_proveedor'] ?? '---') ?>
                             </td>
 
                             <td class="px-8 py-5 text-right">
@@ -448,6 +484,7 @@ function lucideIcon($name, $class = "w-5 h-5") {
                     </tbody>
                 </table>
             </div>
+            <!-- ================= movimientos ================= -->
         <?php elseif ($activeTab === 'movements'): ?>
             <div class="flex justify-between items-end mb-8">
                 <div>
@@ -510,7 +547,10 @@ function lucideIcon($name, $class = "w-5 h-5") {
                             <td class="px-6 py-4 text-xs"><?= htmlspecialchars($m['usuario']) ?></td>
                         </tr>
                         <?php endforeach; ?>
-                        <div id="movementModal" class="hidden fixed inset-0 bg-black/80 backdrop-blur-md z-[60] flex items-center justify-center p-4">
+                        
+                    </tbody>
+                </table>
+                <div id="movementModal" class="hidden fixed inset-0 bg-black/80 backdrop-blur-md z-[60] flex items-center justify-center p-4">
                             <div class="bg-slate-900 border border-slate-800 p-8 rounded-[2.5rem] w-full max-w-md shadow-2xl">
                                 <h2 class="text-2xl font-bold mb-6 text-white text-center">Registrar Entrega</h2>
                                 
@@ -574,181 +614,177 @@ function lucideIcon($name, $class = "w-5 h-5") {
                                 </form>
                             </div>
                         </div>
-                    </tbody>
-                </table>
             </div>
-        <?php elseif ($activeTab === 'purchases'): 
+            <!-- ================= orden de compra ================= -->
+<?php elseif ($activeTab === 'purchases'): 
+            // Consulta para listar las órdenes
             $compras = $pdo->query("SELECT oc.*, p.nombre as proveedor, a.nombre_area 
-                                FROM orden_compra oc 
-                                JOIN proveedor p ON oc.id_proveedor = p.id_proveedor
-                                JOIN area a ON oc.id_area = a.id_area")->fetchAll();
-            ?>
+                                    FROM orden_compra oc 
+                                    JOIN proveedor p ON oc.id_proveedor = p.id_proveedor
+                                    JOIN area a ON oc.id_area = a.id_area 
+                                    ORDER BY oc.id_orden_compra DESC")->fetchAll();
+            
+            // Obtenemos las áreas para el selector del modal
+            $areas = $pdo->query("SELECT id_area, nombre_area FROM area ORDER BY nombre_area ASC")->fetchAll();
+        ?>
             <div class="flex justify-between items-end mb-8">
                 <div>
                     <h1 class="text-3xl font-bold text-white">Órdenes de Compra</h1>
                     <p class="text-slate-500 italic">Gestión de adquisiciones y recepciones</p>
                 </div>
-                <button onclick="openOCModal()" class="bg-indigo-600 hover:bg-indigo-500 px-6 py-3 rounded-2xl font-bold flex items-center gap-2 shadow-lg shadow-indigo-600/20">
+                <button onclick="openOCModal()" class="bg-indigo-600 hover:bg-indigo-500 px-6 py-3 rounded-2xl font-bold flex items-center gap-2 shadow-lg shadow-indigo-600/20 transition-all">
                     <?= lucideIcon('plus') ?> Crear Orden
                 </button>
             </div>
 
-                <div class="bg-slate-900 border border-slate-800 rounded-[2rem] overflow-hidden">
-                    <table class="w-full text-left">
-                        <thead class="bg-slate-800/50 text-slate-500 text-[10px] uppercase">
-                            <tr>
-                                <th class="px-6 py-4">N° Orden</th>
-                                <th class="px-6 py-4">Proveedor</th>
-                                <th class="px-6 py-4">Área</th>
-                                <th class="px-6 py-4">Estado</th>
-                                <th class="px-8 py-4 text-right">Acciones</th>
-                            </tr>
-                        </thead>
-                        <tbody class="divide-y divide-slate-800">
-                            <?php foreach ($compras as $c): ?>
-                            <tr>
-                                <td class="px-6 py-4 font-mono text-indigo-400"><?= $c['numero_oc'] ?></td>
-                                <td class="px-6 py-4"><?= $c['proveedor'] ?></td>
-                                <td class="px-6 py-4"><?= $c['nombre_area'] ?></td>
-                                <td class="px-6 py-4">
-                                    <span class="px-3 py-1 rounded-full text-xs bg-indigo-500/10 text-indigo-400">
-                                        <?= $c['estado_oc'] ?>
-                                    </span>
-                                </td>
-                                <td class="px-8 py-4 text-right">
-                                    <a href="print_oc.php?id=<?= $c['id_orden_compra'] ?>" target="_blank" class="text-slate-400 hover:text-white">
+            <div class="bg-slate-900 border border-slate-800 rounded-[2rem] overflow-hidden">
+                <table class="w-full text-left">
+                    <thead class="bg-slate-800/50 text-slate-500 text-[10px] uppercase">
+                        <tr>
+                            <th class="px-6 py-4">N° Orden</th>
+                            <th class="px-6 py-4">Proveedor</th>
+                            <th class="px-6 py-4">Área</th>
+                            <th class="px-6 py-4">Estado</th>
+                            <th class="px-8 py-4 text-right">Acciones</th>
+                        </tr>
+                    </thead>
+                    <tbody class="divide-y divide-slate-800">
+                        <?php foreach ($compras as $c): ?>
+                        <tr class="hover:bg-slate-800/30 transition-colors">
+                            <td class="px-6 py-4 font-mono text-indigo-400"><?= $c['numero_oc'] ?></td>
+                            <td class="px-6 py-4 text-slate-300"><?= htmlspecialchars($c['proveedor']) ?></td>
+                            <td class="px-6 py-4 text-slate-400"><?= htmlspecialchars($c['nombre_area']) ?></td>
+                            <td class="px-6 py-4">
+                                <?php 
+                                    $statusClass = $c['estado_oc'] === 'Pendiente' ? 'bg-amber-500/10 text-amber-400' : 
+                                                ($c['estado_oc'] === 'Recibida' ? 'bg-emerald-500/10 text-emerald-400' : 'bg-indigo-500/10 text-indigo-400');
+                                ?>
+                                <span class="px-3 py-1 rounded-full text-[10px] font-bold uppercase <?= $statusClass ?>">
+                                    <?= $c['estado_oc'] ?>
+                                </span>
+                            </td>
+                            <td class="px-8 py-4 text-right">
+                                <div class="flex justify-end gap-3">
+                                    <?php if ($c['estado_oc'] === 'Pendiente'): ?>
+                                        <button onclick="openReceiptModal(<?= $c['id_orden_compra'] ?>)" 
+                                                class="flex items-center gap-2 px-4 py-2 bg-emerald-600/20 text-emerald-400 hover:bg-emerald-600 hover:text-white rounded-xl text-xs font-bold transition-all border border-emerald-500/20">
+                                            <?= lucideIcon('package-check', 'w-4 h-4') ?> Recepcionar
+                                        </button>
+                                    <?php endif; ?>
+
+                                    <a href="print_oc.php?id=<?= $c['id_orden_compra'] ?>" target="_blank" class="p-2 text-slate-400 hover:text-white hover:bg-slate-700 rounded-lg transition-all" title="Ver Orden">
                                         <?= lucideIcon('external-link', 'w-5 h-5') ?>
                                     </a>
-                                </td>
-                                <td class="px-8 py-4 text-right">
-                                    <div class="flex justify-end gap-3">
-                                        
-                                        <?php if ($c['estado_oc'] === 'Aceptada'): ?>
-                                            <button onclick="openReceiptModal(<?= $c['id_orden_compra'] ?>)" 
-                                                    class="flex items-center gap-2 px-4 py-2 bg-emerald-600/20 text-emerald-400 hover:bg-emerald-600 hover:text-white rounded-xl font-bold transition-all border border-emerald-500/20">
-                                                <?= lucideIcon('package-check') ?> Recepcionar
-                                            </button>
-                                        <?php endif; ?>
 
-                                        <a href="print_oc.php?id=<?= $c['id_orden_compra'] ?>" target="_blank" class="text-slate-400 hover:text-white">
-                                            <?= lucideIcon('external-link', 'w-5 h-5') ?>
-                                        </a>
-                                    </div>
-                                </td>
-                                <td class="px-8 py-4 text-right">
-                                    <div class="flex justify-end gap-3">
-                                        <?php if ($c['estado_oc'] === 'Aceptada'): ?>
-                                            <button onclick="openReceiptModal(<?= $c['id_orden_compra'] ?>)" 
-                                                    class="flex items-center gap-2 px-4 py-2 bg-emerald-600/20 text-emerald-400 hover:bg-emerald-600 hover:text-white rounded-xl font-bold transition-all border border-emerald-500/20">
-                                                <?= lucideIcon('package-check') ?> Recepcionar
-                                            </button>
-                                        <?php endif; ?>
-
-                                        <a href="print_oc.php?id=<?= $c['id_orden_compra'] ?>" target="_blank" class="text-slate-400 hover:text-white">
-                                            <?= lucideIcon('external-link', 'w-5 h-5') ?>
-                                        </a>
-                                    </div>
-                                </td>
-                            </tr>
-                            <?php endforeach; ?>
-                        <div id="ocModal" class="hidden fixed inset-0 bg-black/80 backdrop-blur-md z-[70] flex items-center justify-center p-4">
-                            <div class="bg-slate-900 border border-slate-800 p-8 rounded-[2.5rem] w-full max-w-3xl shadow-2xl max-h-[90vh] overflow-y-auto">
-                                <h2 class="text-2xl font-bold mb-6 text-white flex items-center gap-2">
-                                    <?= lucideIcon('shopping-basket') ?> Nueva Orden de Compra
-                                </h2>
-                                
-                                <form action="save_oc.php" method="POST" class="space-y-6">
-                                    <div class="grid grid-cols-1 md:grid-cols-3 gap-4">
-                                        <div>
-                                            <label class="text-[10px] font-bold text-slate-500 uppercase ml-1">Proveedor</label>
-                                            <select name="id_proveedor" required class="w-full bg-slate-800 border border-slate-700 rounded-2xl px-4 py-3 outline-none focus:ring-2 focus:ring-indigo-500">
-                                                <?php foreach($proveedores as $p): ?>
-                                                    <option value="<?= $p['id_proveedor'] ?>"><?= htmlspecialchars($p['nombre']) ?></option>
-                                                <?php endforeach; ?>
-                                            </select>
-                                        </div>
-                                        <div>
-                                            <label class="text-[10px] font-bold text-slate-500 uppercase ml-1">Número de OC</label>
-                                            <input type="text" name="numero_oc" required placeholder="OC-0001" class="w-full bg-slate-800 border border-slate-700 rounded-2xl px-4 py-3 outline-none">
-                                        </div>
-                                        <div>
-                                            <label class="text-[10px] font-bold text-slate-500 uppercase ml-1">Tipo Presupuesto</label>
-                                            <input type="text" name="tipo_presupuesto" placeholder="Ej: Salud" class="w-full bg-slate-800 border border-slate-700 rounded-2xl px-4 py-3 outline-none">
-                                        </div>
-                                    </div>
-
-                                    <div class="border-t border-slate-800 pt-6">
-                                        <div class="flex justify-between items-center mb-4">
-                                            <h3 class="text-sm font-bold text-slate-400 uppercase tracking-widest">Productos de la Orden</h3>
-                                            <button type="button" onclick="addProductRow()" class="text-xs bg-indigo-600/20 text-indigo-400 px-3 py-1 rounded-lg border border-indigo-500/30 hover:bg-indigo-600 hover:text-white transition-all">
-                                                + Agregar Fila
-                                            </button>
-                                        </div>
-                                        
-                                        <div id="addProductModal" class="hidden fixed inset-0 bg-black/80 backdrop-blur-sm z-[100] flex items-center justify-center p-4">
-                                            <div class="bg-slate-900 p-8 rounded-[2.5rem] border border-slate-800 w-full max-w-md shadow-2xl">
-                                                <h2 class="text-2xl font-bold text-white mb-6">Nuevo Producto</h2>
-                                                
-                                                <form action="index.php" method="POST" enctype="multipart/form-data" class="space-y-6">
-                                                    <input type="hidden" name="action" value="add">
-                                                    
-                                                    <div>
-                                                        <label class="block text-[10px] font-bold uppercase text-slate-500 mb-2 ml-1">Nombre</label>
-                                                        <input type="text" name="nombre" required placeholder="Ej: Escritorio Ergonómico" 
-                                                            class="w-full bg-slate-800 border border-slate-700 rounded-2xl px-5 py-3 outline-none focus:ring-2 focus:ring-indigo-500 text-white">
-                                                    </div>
-
-                                                    <div>
-                                                        <label class="block text-[10px] font-bold uppercase text-slate-500 mb-2 ml-1">Imagen</label>
-                                                        <input type="file" name="imagen" class="w-full text-xs text-slate-400 file:mr-4 file:py-2 file:px-4 file:rounded-full file:border-0 file:text-xs file:font-semibold file:bg-indigo-600 file:text-white hover:file:bg-indigo-500">
-                                                    </div>
-
-                                                    <div class="grid grid-cols-2 gap-4">
-                                                        <div>
-                                                            <label class="block text-[10px] font-bold uppercase text-slate-500 mb-2 ml-1">Precio</label>
-                                                            <input type="number" step="0.01" name="precio" placeholder="0.00" required 
-                                                                class="w-full bg-slate-800 border border-slate-700 rounded-2xl px-5 py-3 outline-none focus:ring-2 focus:ring-indigo-500 text-white">
-                                                        </div>
-                                                        <div>
-                                                            <label class="block text-[10px] font-bold uppercase text-slate-500 mb-2 ml-1">Stock Inicial</label>
-                                                            <input type="number" name="stock" placeholder="0" required 
-                                                                    class="w-full bg-slate-800 border border-slate-700 rounded-2xl px-5 py-3 outline-none focus:ring-2 focus:ring-indigo-500 text-white">
-                                                        </div>
-                                                    </div>
-
-                                                    <div>
-                                                        <label class="block text-[10px] font-bold uppercase text-slate-500 mb-2 ml-1">Área Municipal</label>
-                                                        <select name="id_area" class="w-full bg-slate-800 border border-slate-700 rounded-2xl px-4 py-3 outline-none focus:ring-2 focus:ring-indigo-500 text-white">
-                                                            <?php foreach ($areasList as $area): ?>
-                                                                <option value="<?= $area['id_area'] ?>"><?= htmlspecialchars($area['nombre_area']) ?></option>
-                                                            <?php endforeach; ?>
-                                                        </select>
-                                                    </div>
-
-                                                    <div class="flex gap-4 pt-4">
-                                                        <button type="button" onclick="closeModal('add')" class="flex-1 text-slate-500 font-bold hover:text-white transition-colors">Cancelar</button>
-                                                        <button type="submit" class="flex-1 bg-indigo-600 hover:bg-indigo-500 py-4 rounded-2xl font-bold text-white shadow-lg shadow-indigo-600/20">Guardar</button>
-                                                    </div>
-                                                </form>
-                                            </div>
-                                        </div>
-
-                                    <div class="flex gap-4 pt-4">
-                                        <button type="button" onclick="closeOCModal()" class="flex-1 text-slate-500 font-bold hover:text-white">Cancelar</button>
-                                        <button type="submit" class="flex-1 bg-indigo-600 py-4 rounded-2xl font-bold hover:bg-indigo-500 shadow-lg shadow-indigo-600/20">
-                                            Generar Orden Pendiente
+                                    <?php if ($c['estado_oc'] === 'Pendiente'): ?>
+                                        <button onclick="deleteOC(<?= $c['id_orden_compra'] ?>, '<?= $c['numero_oc'] ?>')" 
+                                                class="p-2 text-red-400 hover:text-red-500 hover:bg-red-500/10 rounded-lg transition-all"
+                                                title="Eliminar Orden">
+                                            <?= lucideIcon('trash-2', 'w-5 h-5') ?>
                                         </button>
-                                    </div>
-                                </form>
+                                    <?php endif; ?>
+                                </div>
+                            </td>
+                        </tr>
+                        <?php endforeach; ?>
+                    </tbody>
+                </table>
+            </div>
+
+            <div id="ocModal" class="hidden fixed inset-0 bg-black/80 backdrop-blur-md z-[70] flex items-center justify-center p-4">
+                <div class="bg-slate-900 border border-slate-800 p-8 rounded-[2.5rem] w-full max-w-4xl shadow-2xl max-h-[90vh] overflow-y-auto">
+                    <h2 class="text-2xl font-bold mb-6 text-white flex items-center gap-2">
+                        <?= lucideIcon('shopping-basket') ?> Nueva Orden de Compra
+                    </h2>
+                    <form action="save_oc.php" method="POST" class="space-y-6">
+                        <div class="grid grid-cols-1 md:grid-cols-3 gap-6">
+                            <div>
+                                <label class="text-[10px] font-bold text-slate-500 uppercase ml-1">Proveedor</label>
+                                <select name="id_proveedor" required class="w-full bg-slate-800 border border-slate-700 text-white rounded-2xl px-4 py-3 outline-none focus:ring-2 focus:ring-indigo-500 mt-1">
+                                    <option value="">Seleccione un proveedor...</option>
+                                    <?php foreach($proveedores as $p): ?>
+                                        <option value="<?= $p['id_proveedor'] ?>"><?= htmlspecialchars($p['nombre']) ?></option>
+                                    <?php endforeach; ?>
+                                </select>
+                            </div>
+                            <div>
+                                <label class="text-[10px] font-bold text-slate-500 uppercase ml-1">Área de Destino</label>
+                                <select name="id_area_destino" required class="w-full bg-slate-800 border border-slate-700 text-white rounded-2xl px-4 py-3 outline-none focus:ring-2 focus:ring-indigo-500 mt-1">
+                                    <?php foreach($areas as $area): ?>
+                                        <option value="<?= $area['id_area'] ?>"><?= htmlspecialchars($area['nombre_area']) ?></option>
+                                    <?php endforeach; ?>
+                                </select>
+                            </div>
+                            <div>
+                                <label class="text-[10px] font-bold text-slate-500 uppercase ml-1">Motivo / Presupuesto</label>
+                                <input type="text" name="tipo_presupuesto" required placeholder="Ej: Adquisición Oficina" class="w-full bg-slate-800 border border-slate-700 text-white rounded-2xl px-4 py-3 outline-none focus:ring-2 focus:ring-indigo-500 mt-1">
                             </div>
                         </div>
-                        </tbody>
-                    </table>
+
+                        <div class="border-t border-slate-800 pt-6">
+                            <div class="flex justify-between items-center mb-4">
+                                <h3 class="text-sm font-bold text-slate-400 uppercase tracking-widest">Productos del Pedido</h3>
+                                <button type="button" onclick="addProductRow()" class="text-xs bg-indigo-600/20 text-indigo-400 px-4 py-2 rounded-xl border border-indigo-500/30 hover:bg-indigo-600 hover:text-white transition-all">
+                                    + Agregar otro producto
+                                </button>
+                            </div>
+                            <div id="ocItemsContainer" class="space-y-3">
+                                <div class="grid grid-cols-12 gap-3 items-end bg-slate-800/30 p-4 rounded-2xl border border-slate-800">
+                                    <div class="col-span-6">
+                                        <label class="text-[9px] uppercase text-slate-500 font-bold ml-1">Producto / Modelo</label>
+                                        <input type="text" name="items[0][nombre_producto]" placeholder="Escribe el nombre o modelo..." required class="w-full bg-slate-900 border border-slate-700 text-white rounded-xl px-3 py-2 text-sm outline-none">
+                                    </div>
+                                    <div class="col-span-2">
+                                        <label class="text-[9px] uppercase text-slate-500 font-bold ml-1">Cant.</label>
+                                        <input type="number" name="items[0][cantidad]" placeholder="0" min="1" required class="w-full bg-slate-900 border border-slate-700 text-white rounded-xl px-3 py-2 text-sm outline-none">
+                                    </div>
+                                    <div class="col-span-3">
+                                        <label class="text-[9px] uppercase text-slate-500 font-bold ml-1">Precio Compra</label>
+                                        <input type="number" step="0.01" name="items[0][precio]" placeholder="$" required class="w-full bg-slate-900 border border-slate-700 text-white rounded-xl px-3 py-2 text-sm outline-none">
+                                    </div>
+                                </div>
+                            </div>
+                        </div>
+
+                        <div class="flex gap-4 pt-6">
+                            <button type="button" onclick="closeOCModal()" class="flex-1 text-slate-500 font-bold hover:text-white py-4 transition-colors">Cancelar</button>
+                            <button type="submit" class="flex-1 bg-indigo-600 py-4 rounded-2xl font-bold text-white hover:bg-indigo-500 transition-all">Generar Orden Pendiente</button>
+                        </div>
+                    </form>
                 </div>
+            </div>
 
+            <div id="receiptModal" class="hidden fixed inset-0 bg-black/80 backdrop-blur-md z-[80] flex items-center justify-center p-4">
+                <div class="bg-slate-900 border border-slate-800 p-8 rounded-[2.5rem] w-full max-w-lg shadow-2xl">
+                    <h2 class="text-2xl font-bold mb-2 text-white flex items-center gap-2">
+                        <?= lucideIcon('package-check', 'text-emerald-500') ?> Recepcionar Pedido
+                    </h2>
+                    <p class="text-slate-500 text-sm mb-6">Sube el comprobante para cargar los productos al inventario.</p>
+                    
+                    <form action="recepcionar_oc.php" method="POST" enctype="multipart/form-data" class="space-y-5">
+                        <input type="hidden" name="id_orden_compra" id="receipt_id_oc">
+                        
+                        <div class="bg-slate-800/50 p-6 rounded-2xl border-2 border-dashed border-slate-700 hover:border-indigo-500 transition-colors group">
+                            <label class="cursor-pointer flex flex-col items-center gap-3">
+                                <div class="p-3 bg-slate-800 rounded-xl group-hover:bg-indigo-600/20 group-hover:text-indigo-400 transition-all">
+                                    <?= lucideIcon('upload-cloud', 'w-8 h-8') ?>
+                                </div>
+                                <span class="text-xs font-bold text-slate-400 uppercase tracking-widest text-center">Seleccionar Boleta/Factura</span>
+                                <input type="file" name="boleta" accept="image/*,.pdf" required class="hidden" onchange="updateFileName(this)">
+                                <span id="fileName" class="text-[10px] text-indigo-400 italic">No se ha seleccionado archivo</span>
+                            </label>
+                        </div>
+
+                        <div class="flex gap-4 pt-2">
+                            <button type="button" onclick="closeReceiptModal()" class="flex-1 text-slate-500 font-bold hover:text-white transition-colors">Cancelar</button>
+                            <button type="submit" class="flex-1 bg-emerald-600 py-3 rounded-2xl font-bold text-white hover:bg-emerald-500 shadow-lg shadow-emerald-600/20 transition-all">
+                                Confirmar Ingreso
+                            </button>
+                        </div>
+                    </form>
+                </div>
+            </div>
         <?php endif; ?>
-        
-
     </div>
 </section>
 
@@ -822,18 +858,28 @@ function lucideIcon($name, $class = "w-5 h-5") {
         if (e.target.id === 'productModal') closeModal();
     });
     function openMovementModal() {
-    document.getElementById('movementModal').classList.remove('hidden');
+        document.getElementById('movementModal').classList.remove('hidden');
+        document.body.style.overflow = 'hidden'; // Evita que se haga scroll al fondo
     }
 
     function closeMovementModal() {
         document.getElementById('movementModal').classList.add('hidden');
+        document.body.style.overflow = 'auto'; // Devuelve el scroll
+    }
+
+    // Cerrar el modal si se hace clic fuera del cuadro blanco
+    window.onclick = function(event) {
+        const modal = document.getElementById('movementModal');
+        if (event.target == modal) {
+            closeMovementModal();
+        }
     }
 
     // Cerrar al hacer clic fuera
     document.getElementById('movementModal').addEventListener('click', (e) => {
         if (e.target.id === 'movementModal') closeMovementModal();
     });
-    let rowCount = 1;
+
 
     function openOCModal() {
         document.getElementById('ocModal').classList.remove('hidden');
@@ -843,37 +889,67 @@ function lucideIcon($name, $class = "w-5 h-5") {
         document.getElementById('ocModal').classList.add('hidden');
     }
 
+
+    let rowCount = 1; // Empezamos en 1 porque la fila 0 ya está en el HTML
+
     function addProductRow() {
-        const container = document.getElementById('productRows');
-        const newRow = document.createElement('div');
-        newRow.className = "grid grid-cols-12 gap-3 items-center bg-slate-800/30 p-3 rounded-2xl border border-slate-800 animate-in fade-in slide-in-from-top-2";
+        const container = document.getElementById('ocItemsContainer');
         
-        // Usamos el HTML de la primera fila pero actualizamos el índice rowCount
+        // Creamos el nuevo slot
+        const newRow = document.createElement('div');
+        newRow.className = "grid grid-cols-12 gap-3 items-end bg-slate-800/30 p-4 rounded-2xl border border-slate-800 animate-in fade-in slide-in-from-top-2";
+        
         newRow.innerHTML = `
             <div class="col-span-6">
-                <select name="items[${rowCount}][id_producto]" required class="w-full bg-slate-900 border border-slate-700 rounded-xl px-3 py-2 text-sm outline-none">
-                    ${document.querySelector('#productRows select').innerHTML}
-                </select>
-            </div>
-            <div class="col-span-3">
-                <input type="number" name="items[${rowCount}][cantidad]" placeholder="Cant." min="1" required class="w-full bg-slate-900 border border-slate-700 rounded-xl px-3 py-2 text-sm outline-none">
+                <label class="text-[9px] uppercase text-slate-500 font-bold ml-1">Producto</label>
+                <input type="text" 
+                    name="items[${rowCount}][nombre_producto]" 
+                    placeholder="Escribe el nombre del producto..." 
+                    required 
+                    class="w-full bg-slate-900 border border-slate-700 text-white rounded-xl px-3 py-2 text-sm outline-none focus:ring-1 focus:ring-indigo-500">
             </div>
             <div class="col-span-2">
-                <input type="number" step="0.01" name="items[${rowCount}][precio]" placeholder="Precio" required class="w-full bg-slate-900 border border-slate-700 rounded-xl px-3 py-2 text-sm outline-none">
+                <label class="text-[9px] uppercase text-slate-500 font-bold ml-1">Cant.</label>
+                <input type="number" 
+                    name="items[${rowCount}][cantidad]" 
+                    placeholder="0" 
+                    min="1" 
+                    required 
+                    class="w-full bg-slate-900 border border-slate-700 text-white rounded-xl px-3 py-2 text-sm outline-none">
+            </div>
+            <div class="col-span-3">
+                <label class="text-[9px] uppercase text-slate-500 font-bold ml-1">Precio Compra</label>
+                <input type="number" 
+                    step="0.01" 
+                    name="items[${rowCount}][precio]" 
+                    placeholder="$" 
+                    required 
+                    class="w-full bg-slate-900 border border-slate-700 text-white rounded-xl px-3 py-2 text-sm outline-none">
             </div>
             <div class="col-span-1 text-right">
-                <button type="button" onclick="this.parentElement.parentElement.remove()" class="text-red-500 hover:text-red-400">
-                    ${lucide.createIcons() || '✕'}
+                <button type="button" onclick="this.parentElement.parentElement.remove()" class="text-red-500 hover:text-red-400 p-2 transition-colors">
+                    <i data-lucide="trash-2" class="w-5 h-5"></i>
                 </button>
             </div>
         `;
+        
         container.appendChild(newRow);
         rowCount++;
-        lucide.createIcons(); // Para que el icono de eliminar se dibuje
+        
+        // Si usas Lucide para los iconos, esto los renderiza en la nueva fila
+        if (typeof lucide !== 'undefined') {
+            lucide.createIcons();
+        }
     }
+    function deleteOC(id, numero) {
+    if (confirm(`¿Estás seguro de eliminar la orden ${numero}? Esta acción no se puede deshacer.`)) {
+        window.location.href = `delete_oc.php?id=${id}`;
+    }
+    }
+
     function openReceiptModal(id) {
-    document.getElementById('receipt_id_oc').value = id;
-    document.getElementById('receiptModal').classList.remove('hidden');
+        document.getElementById('receipt_id_oc').value = id;
+        document.getElementById('receiptModal').classList.remove('hidden');
     }
 
     function closeReceiptModal() {
@@ -881,40 +957,50 @@ function lucideIcon($name, $class = "w-5 h-5") {
     }
 
     function updateFileName(input) {
-        const fileName = input.files[0] ? input.files[0].name : "No se ha seleccionado archivo";
-        document.getElementById('fileName').textContent = fileName;
+        const label = document.getElementById('fileName');
+        if (input.files && input.files[0]) {
+            // Si hay archivo, mostramos el nombre y cambiamos el color a verde
+            label.innerText = "📄 Archivo listo: " + input.files[0].name;
+            label.classList.remove('text-indigo-400');
+            label.classList.add('text-emerald-400', 'font-bold');
+        } else {
+            // Si se cancela la selección
+            label.innerText = "No se ha seleccionado archivo";
+            label.classList.remove('text-emerald-400');
+            label.classList.add('text-indigo-400');
+        }
+    }
+
+    function closeReceiptModal() {
+        document.getElementById('receiptModal').classList.add('hidden');
+    }
+
+
+</script>
+<script src="https://cdn.jsdelivr.net/npm/sweetalert2@11"></script>
+<script>
+    const urlParams = new URLSearchParams(window.location.search);
+    if (urlParams.get('status') === 'error') {
+        Swal.fire({
+            icon: 'error',
+            title: 'Movimiento Fallido',
+            text: urlParams.get('msg') || 'Error desconocido',
+            background: '#0f172a',
+            color: '#fff',
+            confirmButtonColor: '#10b981'
+        });
+    }
+    if (urlParams.get('status') === 'success') {
+        Swal.fire({
+            icon: 'success',
+            title: '¡Registrado!',
+            text: 'El movimiento se ha guardado correctamente.',
+            background: '#0f172a',
+            color: '#fff',
+            confirmButtonColor: '#10b981'
+        });
     }
 </script>
-<div id="receiptModal" class="hidden fixed inset-0 bg-black/80 backdrop-blur-md z-[80] flex items-center justify-center p-4">
-    <div class="bg-slate-900 border border-slate-800 p-8 rounded-[2.5rem] w-full max-w-md shadow-2xl">
-        <h2 class="text-2xl font-bold mb-2 text-white flex items-center gap-2">
-            <?= lucideIcon('file-up') ?> Recepcionar Mercadería
-        </h2>
-        <p class="text-slate-500 text-sm mb-6">Sube el respaldo de la compra para ingresar los productos al inventario.</p>
-        
-        <form action="recepcionar_oc.php" method="POST" enctype="multipart/form-data" class="space-y-5">
-            <input type="hidden" name="id_orden_compra" id="receipt_id_oc">
-            
-            <div class="bg-slate-800/50 p-6 rounded-2xl border-2 border-dashed border-slate-700 hover:border-indigo-500 transition-colors group">
-                <label class="cursor-pointer flex flex-col items-center gap-3">
-                    <div class="p-3 bg-slate-800 rounded-xl group-hover:bg-indigo-600/20 group-hover:text-indigo-400 transition-all">
-                        <?= lucideIcon('upload-cloud', 'w-8 h-8') ?>
-                    </div>
-                    <span class="text-xs font-bold text-slate-400 uppercase tracking-widest">Seleccionar Boleta/Factura</span>
-                    <input type="file" name="boleta" accept="image/*,.pdf" required class="hidden" onchange="updateFileName(this)">
-                    <span id="fileName" class="text-[10px] text-indigo-400 italic">No se ha seleccionado archivo</span>
-                </label>
-            </div>
-
-            <div class="flex gap-4 pt-2">
-                <button type="button" onclick="closeReceiptModal()" class="flex-1 text-slate-500 font-bold hover:text-white transition-colors">Cancelar</button>
-                <button type="submit" class="flex-1 bg-emerald-600 py-3 rounded-2xl font-bold text-white hover:bg-emerald-500 shadow-lg shadow-emerald-600/20 transition-all">
-                    Confirmar Ingreso
-                </button>
-            </div>
-        </form>
-    </div>
-</div>
 
 </body>
 </html>
